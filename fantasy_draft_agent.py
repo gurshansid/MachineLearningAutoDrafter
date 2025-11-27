@@ -1,15 +1,15 @@
 """
-TRULY PURE RL - Zero Domain Knowledge
+HIERARCHICAL RL POLICY
 
-Restart criteria: ONLY based on performance (score improvement)
-No assumptions about QB/RB/WR strategy at all
-
-Agent must discover everything from scratch through experience
+1. Position Network: Decides which position to draft (QB/RB/WR/TE)
+2. Player Networks: Four separate networks (one per position) that evaluate
+   specific players at that position
+   - Each position has its own file for customization
 """
 
 import copy
 import random
-from typing import Optional
+from typing import Optional, Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,53 +17,38 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import os
-import time
+
+# Import each position's network from separate files
+from qb_network import QBPlayerNetwork, get_qb_features
+from rb_network import RBPlayerNetwork, get_rb_features
+from wr_network import WRPlayerNetwork, get_wr_features
+from te_network import TEPlayerNetwork, get_te_features
 
 
 # ============================================================================
-# NETWORK
+# NETWORKS
 # ============================================================================
 
 
-class ContextAwarePlayerValueNetwork(nn.Module):
-    def __init__(self, player_feature_size: int, context_size: int = 10):
+class PositionPolicyNetwork(nn.Module):
+    """Decides which position to draft given context"""
+    def __init__(self, context_size: int = 10):
         super().__init__()
-
-        # Encodes the draft context (round, pick, roster needs, etc.)
-        self.context_encoder = nn.Sequential(
-            nn.Linear(context_size, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-        )
-
-        # Encodes the "player" feature vector – in our case, a 4-dim
-        # one-hot for position (QB/RB/WR/TE), but this stays generic.
-        self.player_encoder = nn.Sequential(
-            nn.Linear(player_feature_size, 64),
+        
+        self.network = nn.Sequential(
+            nn.Linear(context_size, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
+            nn.Linear(32, 4),  # Output: scores for QB/RB/WR/TE
         )
 
-        # Combine context + player/position into a single scalar "value"
-        self.decision_head = nn.Sequential(
-            nn.Linear(16 + 32, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-
-    def forward(self, player_features: torch.Tensor, context_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
         """
-        player_features: [batch, player_feature_size]
-        context_features: [batch, context_size]
-        returns: [batch, 1] scores for each (context, player/position) pair
+        context: [batch, context_size]
+        returns: [batch, 4] scores for each position
         """
-        context_encoded = self.context_encoder(context_features)
-        player_encoded = self.player_encoder(player_features)
-        combined = torch.cat([context_encoded, player_encoded], dim=1)
-        return self.decision_head(combined)
+        return self.network(context)
 
 
 # ============================================================================
@@ -93,7 +78,7 @@ class DraftEnvironment:
         self.roster_limits = {"QB": 2, "RB": 5, "WR": 5, "TE": 3}
         self.starting_requirements = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
 
-        # Load condensed CSV for drafting (with ADP)
+        # Load condensed CSV for drafting (with ADP and features)
         df_draft = pd.read_csv(draft_data_path)
 
         # Convert position one-hot columns to a single 'position' column
@@ -110,7 +95,6 @@ class DraftEnvironment:
         df_scoring = df_scoring[df_scoring["position"].isin(["QB", "RB", "WR", "TE"])].copy()
 
         # Merge scoring data into draft data
-        # Match on first_name and last_name
         df_draft = df_draft.merge(
             df_scoring[["first_name", "last_name", "fantasy_points_ppr"]],
             on=["first_name", "last_name"],
@@ -119,13 +103,54 @@ class DraftEnvironment:
         )
 
         # Use actual 2024 fantasy_points_ppr for scoring
-        # If no match found, use a default low score
-        df_draft["fantasy_points_ppr"] = df_draft["fantasy_points_ppr"].fillna(0.0)
+        df_draft['fantasy_points_ppr'] = df_draft['fantasy_points_ppr'].fillna(0.0)
 
         self.player_pool = df_draft
+        
+        # Define which columns to use as player features
+        self.feature_columns = [
+            'fantasy_adp', 'age', 'is_rookie', 'team_win_pct_weighted',
+            'avg_points_per_game', 'avg_games', 'avg_rushing_yards',
+            'avg_rushing_tds', 'avg_receptions', 'avg_receiving_yards',
+            'avg_receiving_tds', 'avg_passing_yards', 'avg_passing_tds'
+        ]
+        
+        # Normalize features for neural network
+        self._normalize_features()
+        
         self.reset()
         print(f"[Environment] Loaded {len(df_draft)} players for drafting")
         print(f"[Environment] Using actual 2024 stats for scoring")
+
+    def _normalize_features(self):
+        """Normalize feature columns to [0, 1] range"""
+        for col in self.feature_columns:
+            if col in self.player_pool.columns:
+                col_data = self.player_pool[col].fillna(0.0)
+                min_val = col_data.min()
+                max_val = col_data.max()
+                if max_val > min_val:
+                    self.player_pool[f'{col}_norm'] = (col_data - min_val) / (max_val - min_val)
+                else:
+                    self.player_pool[f'{col}_norm'] = 0.0
+
+    def get_player_features(self, player_row: pd.Series, position: str) -> np.ndarray:
+        """
+        Extract position-specific feature vector for a player
+        Each position uses its own feature extraction function
+        """
+        if position == "QB":
+            features = get_qb_features(player_row, self)
+        elif position == "RB":
+            features = get_rb_features(player_row, self)
+        elif position == "WR":
+            features = get_wr_features(player_row, self)
+        elif position == "TE":
+            features = get_te_features(player_row, self)
+        else:
+            features = []
+        
+        return np.array(features, dtype=np.float32)
 
     def _get_position_from_onehot(self, row):
         """Convert one-hot position columns to single position string"""
@@ -279,203 +304,162 @@ class DraftEnvironment:
             for p in lineup[pos]
         )
 
-    def position_available_for_team(self, team_id: int, position: str) -> bool:
-        """
-        Check whether this team can draft the given position *and*
-        there is at least one remaining player at that position.
-        """
+    def get_available_at_position(self, team_id: int, position: str):
+        """Get all available players at a position that this team can draft"""
         if not self.can_draft_position(team_id, position):
-            return False
-
+            return []
+        
         available = self.get_available_players()
         if available.empty:
-            return False
-
-        return (available["position"] == position).any()
-
-    def pick_best_player_at_position(self, team_id: int, position: str):
-        """
-        Return the best remaining ADP player at the given position
-        that this team is allowed to draft. If none are available,
-        return None.
-        """
-        available = self.get_available_players()
-        if available.empty:
-            return None
-
-        if not self.can_draft_position(team_id, position):
-            return None
-
+            return []
+        
         avail_pos = available[available["position"] == position]
-        if avail_pos.empty:
-            return None
-
-        # player_pool is ADP-sorted, and available preserves that order,
-        # so the first row is the best ADP at this position.
-        return avail_pos.iloc[0]
+        return [row for _, row in avail_pos.iterrows()]
 
     def evaluate_league(self):
         return {tid: self.team_score(tid) for tid in range(self.n_teams)}
 
 
 # ============================================================================
-# AGENT (POSITION POLICY)
+# HIERARCHICAL AGENT
 # ============================================================================
 
 
-class DraftAgent:
+class HierarchicalDraftAgent:
     """
-    Position-policy agent.
-
-    The action is *which position to draft* (QB/RB/WR/TE).
-    After the agent chooses a position, the environment selects
-    the best remaining ADP player at that position.
+    Two-stage decision process:
+    1. Position policy: decides which position to draft
+    2. Player policy: decides which specific player at that position
     """
 
-    def __init__(self, model: nn.Module):
-        self.model = model
-        self.device = next(model.parameters()).device
-
-        # Fixed discrete action space
+    def __init__(self, position_model: nn.Module, player_models: Dict[str, nn.Module]):
+        self.position_model = position_model
+        self.player_models = player_models  # {"QB": model, "RB": model, ...}
+        self.device = next(position_model.parameters()).device
+        
         self.positions = ["QB", "RB", "WR", "TE"]
         self.pos_to_idx = {p: i for i, p in enumerate(self.positions)}
 
-    def get_position_features(self, position: str):
-        """Return a 4-dim one-hot vector encoding the position."""
-        vec = np.zeros(len(self.positions), dtype=np.float32)
-        vec[self.pos_to_idx[position]] = 1.0
-        return vec
-
-    def pick_position(self, env, team_id: int, round_num: int, epsilon: float, training: bool = True):
+    def pick_player(self, env, team_id: int, round_num: int, epsilon: float, training: bool = True):
         """
-        Sample a position to draft for this pick.
-
-        - Build a candidate set of legal positions (roster limit + players left).
-        - For each candidate position, form (position_one_hot, context_vector).
-        - Use the model to score each candidate.
-        - ε-greedy: with probability ε pick a random legal position,
-          otherwise pick argmax over the model scores.
+        Two-stage pick:
+        1. Choose position using position_model
+        2. Choose specific player at that position using player_models[position]
         """
         context = env.get_context_vector(team_id, round_num)
-        context = np.asarray(context, dtype=np.float32)
-
+        context_tensor = torch.tensor(context, dtype=torch.float32, device=self.device).unsqueeze(0)
+        
+        # STAGE 1: Choose position
         legal_positions = []
-        pos_feats = []
-
+        legal_indices = []
+        
         for pos in self.positions:
-            if env.position_available_for_team(team_id, pos):
+            if env.get_available_at_position(team_id, pos):
                 legal_positions.append(pos)
-                pos_feats.append(self.get_position_features(pos))
-
+                legal_indices.append(self.pos_to_idx[pos])
+        
         if not legal_positions:
-            return None, None
-
-        pos_tensor = torch.tensor(
-            np.stack(pos_feats),
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-        context_batch = torch.tensor(
-            np.repeat(context[None, :], len(legal_positions), axis=0),
-            dtype=torch.float32,
-            device=self.device,
-        )
-
+            return None, None, None
+        
+        # Get position scores
         if training:
-            self.model.train()
+            self.position_model.train()
         else:
-            self.model.eval()
-
+            self.position_model.eval()
+        
         with torch.set_grad_enabled(training):
-            logits = self.model(pos_tensor, context_batch).squeeze(1)
-            probs = torch.softmax(logits, dim=0)
-
+            position_logits = self.position_model(context_tensor).squeeze(0)  # [4]
+            
+            # Mask illegal positions
+            legal_mask = torch.full((4,), float('-inf'), device=self.device)
+            for idx in legal_indices:
+                legal_mask[idx] = 0.0
+            
+            masked_logits = position_logits + legal_mask
+            position_probs = torch.softmax(masked_logits, dim=0)
+            
+            # ε-greedy position selection
             if training and random.random() < epsilon:
-                idx = random.randrange(len(legal_positions))
+                chosen_pos_idx = random.choice(legal_indices)
             else:
-                idx = int(torch.argmax(probs).item())
-
-            log_prob = torch.log(probs[idx] + 1e-10) if training else None
-
-        chosen_pos = legal_positions[idx]
-        return chosen_pos, log_prob
+                chosen_pos_idx = int(torch.argmax(position_probs).item())
+            
+            position_log_prob = torch.log(position_probs[chosen_pos_idx] + 1e-10) if training else None
+        
+        chosen_position = self.positions[chosen_pos_idx]
+        
+        # STAGE 2: Choose specific player at that position
+        available_players = env.get_available_at_position(team_id, chosen_position)
+        
+        if not available_players:
+            return None, None, None
+        
+        # Get player features for all available players at this position
+        player_features = []
+        for player_row in available_players:
+            feat = env.get_player_features(player_row, chosen_position)
+            player_features.append(feat)
+        
+        player_features_tensor = torch.tensor(
+            np.stack(player_features),
+            dtype=torch.float32,
+            device=self.device
+        )
+        
+        # Repeat context for each player
+        context_batch = context_tensor.repeat(len(available_players), 1)
+        
+        # Get player values from position-specific model
+        player_model = self.player_models[chosen_position]
+        
+        if training:
+            player_model.train()
+        else:
+            player_model.eval()
+        
+        with torch.set_grad_enabled(training):
+            player_values = player_model(player_features_tensor, context_batch).squeeze(1)
+            player_probs = torch.softmax(player_values, dim=0)
+            
+            # ε-greedy player selection
+            if training and random.random() < epsilon:
+                player_idx = random.randrange(len(available_players))
+            else:
+                player_idx = int(torch.argmax(player_probs).item())
+            
+            player_log_prob = torch.log(player_probs[player_idx] + 1e-10) if training else None
+        
+        chosen_player = available_players[player_idx]
+        
+        # Combine log probs for total action probability
+        total_log_prob = None
+        if training and position_log_prob is not None and player_log_prob is not None:
+            total_log_prob = position_log_prob + player_log_prob
+        
+        return chosen_player, total_log_prob, chosen_position
 
 
 # ============================================================================
-# PURE PERFORMANCE-BASED RESTART DETECTION
+# TRAINING
 # ============================================================================
 
 
-def should_restart_based_on_performance(scores, score_threshold=1800, min_improvement=5):
-    """
-    Heuristic for deciding when to restart training:
-
-    - If fewer than 400 episodes: never restart (too early)
-    - Otherwise:
-        • Look at the last 200 vs previous 200 episodes
-        • If recent avg >= threshold → NEVER restart (we're good)
-        • Else if improvement < min_improvement → restart
-    """
-    if len(scores) < 400:
-        return False, None
-
-    recent_200 = scores[-200:]
-    previous_200 = scores[-400:-200]
-
-    recent_avg = np.mean(recent_200)
-    previous_avg = np.mean(previous_200)
-    improvement = recent_avg - previous_avg
-
-    if recent_avg >= score_threshold:
-        return False, None
-
-    if improvement < min_improvement:
-        return True, {
-            "recent_avg": recent_avg,
-            "previous_avg": previous_avg,
-            "improvement": improvement,
-        }
-
-    return False, None
-
-
-# ============================================================================
-# TRAINING WITH PERFORMANCE-ONLY RESTARTS
-# ============================================================================
-
-
-def train_pure_performance_restarts(
+def train_hierarchical_agent(
     total_episodes=5000,
-    restart_check_window=300,
-    score_threshold=1800,
-    max_restarts=5,
     learning_rate=1e-3,
 ):
-    """
-    Train with restarts based ONLY on score threshold
-    """
+    """Train hierarchical agent with position + player policies"""
 
     print("=" * 80)
-    print("TRULY PURE RL - Score Threshold Restarts")
+    print("HIERARCHICAL RL - Position + Player Policies")
     print("=" * 80)
-    print("\nPhilosophy:")
-    print("  • NO domain knowledge about positions")
-    print("  • NO hints about when to draft QB/RB/WR")
-    print("  • Restart based ONLY on performance")
-    print("\nBot opponents:")
-    print("  • Draft from top ADP players (with slippage)")
-    print("  • Makes them beatable - agent has room to learn")
-    print("\nRestart trigger (checked every 200 episodes):")
-    print(f"  • Score < {score_threshold} AND improving < 5 points per 200 eps → RESTART")
-    print("  • Score >= threshold → NEVER restart (optimal!)")
+    print("\nArchitecture:")
+    print("  • Position network: decides QB/RB/WR/TE")
+    print("  • Player networks: 4 separate networks for each position")
+    print("  • Learns which specific players to target, not just positions")
     print("=" * 80 + "\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # We now treat "player features" as a 4-dim one-hot vector for position:
-    # [QB, RB, WR, TE]
-    player_feature_size = 4
 
     # Use a derived env seed so runs are reproducible given the base seed,
     # but different across separate runs when the base seed changes.
@@ -489,31 +473,46 @@ def train_pure_performance_restarts(
         seed=env_seed,
     )
 
+    # Create networks - each position has its own architecture and features
+    position_model = PositionPolicyNetwork(context_size=10).to(device)
+    
+    # Get feature sizes for each position (may be different!)
+    sample_qb = env.player_pool[env.player_pool['position'] == 'QB'].iloc[0]
+    sample_rb = env.player_pool[env.player_pool['position'] == 'RB'].iloc[0]
+    sample_wr = env.player_pool[env.player_pool['position'] == 'WR'].iloc[0]
+    sample_te = env.player_pool[env.player_pool['position'] == 'TE'].iloc[0]
+    
+    qb_feature_size = len(get_qb_features(sample_qb, env))
+    rb_feature_size = len(get_rb_features(sample_rb, env))
+    wr_feature_size = len(get_wr_features(sample_wr, env))
+    te_feature_size = len(get_te_features(sample_te, env))
+    
+    print(f"Feature sizes: QB={qb_feature_size}, RB={rb_feature_size}, WR={wr_feature_size}, TE={te_feature_size}")
+    
+    player_models = {
+        "QB": QBPlayerNetwork(qb_feature_size, context_size=10).to(device),
+        "RB": RBPlayerNetwork(rb_feature_size, context_size=10).to(device),
+        "WR": WRPlayerNetwork(wr_feature_size, context_size=10).to(device),
+        "TE": TEPlayerNetwork(te_feature_size, context_size=10).to(device),
+    }
+    
+    # Separate optimizers for each network
+    position_optimizer = optim.Adam(position_model.parameters(), lr=learning_rate)
+    player_optimizers = {
+        pos: optim.Adam(model.parameters(), lr=learning_rate)
+        for pos, model in player_models.items()
+    }
+    
+    agent = HierarchicalDraftAgent(position_model, player_models)
+
     all_scores = []
     all_ranks = []
     all_rewards = []
-    restart_episodes = []
 
-    best_model_state = None
     best_avg_score = -float("inf")
+    best_models = None
 
-    num_restarts = 0
-    episodes_done = 0
-    current_attempt = 1
-
-    print(f"\nATTEMPT {current_attempt}/{max_restarts + 1}\n")
-
-    model = ContextAwarePlayerValueNetwork(
-        player_feature_size=player_feature_size,
-        context_size=10,
-    ).to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    agent = DraftAgent(model)
-
-    while episodes_done < total_episodes:
-        ep = episodes_done
-
+    for ep in range(total_episodes):
         epsilon = max(0.05, 0.9 - 0.85 * (ep / total_episodes))
 
         our_team = env.reset()
@@ -525,15 +524,11 @@ def train_pure_performance_restarts(
 
             for tid in order:
                 if tid == our_team:
-                    position, log_prob = agent.pick_position(env, tid, rnd, epsilon, training=True)
-                    if position is not None:
-                        player = env.pick_best_player_at_position(tid, position)
-                        if player is None:
-                            player = env.bot_pick(tid)
-                        if player is not None:
-                            env.make_pick(tid, player)
-                            if log_prob is not None:
-                                log_probs.append(log_prob)
+                    player, log_prob, position = agent.pick_player(env, tid, rnd, epsilon, training=True)
+                    if player is not None:
+                        env.make_pick(tid, player)
+                        if log_prob is not None:
+                            log_probs.append(log_prob)
                 else:
                     player = env.bot_pick(tid)
                     if player is not None:
@@ -551,84 +546,61 @@ def train_pure_performance_restarts(
         if log_probs:
             loss = -(torch.stack(log_probs) * reward).mean()
 
-            optimizer.zero_grad()
+            # Update all networks
+            position_optimizer.zero_grad()
+            for opt in player_optimizers.values():
+                opt.zero_grad()
+            
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
+            
+            nn.utils.clip_grad_norm_(position_model.parameters(), 5.0)
+            for model in player_models.values():
+                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            
+            position_optimizer.step()
+            for opt in player_optimizers.values():
+                opt.step()
 
         all_scores.append(our_score)
         all_ranks.append(our_rank)
         all_rewards.append(reward)
 
-        episodes_done += 1
-
-        if episodes_done % 50 == 0:
+        if (ep + 1) % 50 == 0:
             window = min(100, len(all_scores))
             avg_score = np.mean(all_scores[-window:])
             avg_rank = np.mean(all_ranks[-window:])
 
             print(
-                f"Ep {episodes_done:4d}/{total_episodes} | "
+                f"Ep {ep+1:4d}/{total_episodes} | "
                 f"Score:{our_score:6.1f} Rank:{our_rank:2d}/12 | "
                 f"Avg{window}[S:{avg_score:6.1f} Rk:{avg_rank:4.1f}] | "
-                f"Attempt:{current_attempt} | ε:{epsilon:.3f}"
+                f"ε:{epsilon:.3f}"
             )
 
         if len(all_scores) >= 100:
             recent_avg = np.mean(all_scores[-100:])
             if recent_avg > best_avg_score:
                 best_avg_score = recent_avg
-                best_model_state = copy.deepcopy(model.state_dict())
-
-        if episodes_done % 200 == 0 and episodes_done >= 400:
-            should_restart, reason = should_restart_based_on_performance(
-                all_scores,
-                score_threshold=score_threshold,
-            )
-
-            if should_restart and num_restarts < max_restarts:
-                recent_avg = np.mean(all_scores[-200:])
-                prev_avg = np.mean(all_scores[-400:-200])
-                print("\n" + "-" * 60)
-                print(f"RESTARTING at episode {episodes_done}!")
-                print(f"  Previous 200 avg: {prev_avg:.1f}")
-                print(f"  Recent   200 avg: {recent_avg:.1f}")
-                print(
-                    f"  Improvement:      {recent_avg - prev_avg:.1f} "
-                    f"(threshold {reason['improvement']:.1f})"
-                )
-                print("-" * 60 + "\n")
-
-                restart_episodes.append(episodes_done)
-                num_restarts += 1
-                current_attempt += 1
-
-                model = ContextAwarePlayerValueNetwork(
-                    player_feature_size=player_feature_size,
-                    context_size=10,
-                ).to(device)
-                optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-                agent = DraftAgent(model)
-
-            elif not should_restart:
-                recent_avg = np.mean(all_scores[-200:])
-                print(
-                    f"\nNo restart at ep {episodes_done}: "
-                    f"recent 200 avg score = {recent_avg:.1f} "
-                    f"(threshold {score_threshold}) - continuing...\n"
-                )
+                best_models = {
+                    'position': copy.deepcopy(position_model.state_dict()),
+                    'players': {pos: copy.deepcopy(model.state_dict()) 
+                               for pos, model in player_models.items()}
+                }
 
     print("\nTraining complete.")
-    print(f"Total restarts: {num_restarts}")
-    if restart_episodes:
-        print("Restart episodes: ", restart_episodes)
 
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        torch.save(model.state_dict(), "fantasy_draft_agent.pth")
-        print("\n✓ Saved best-performing model to fantasy_draft_agent.pth")
+    if best_models is not None:
+        position_model.load_state_dict(best_models['position'])
+        for pos, state in best_models['players'].items():
+            player_models[pos].load_state_dict(state)
+        
+        torch.save({
+            'position_model': position_model.state_dict(),
+            'player_models': {pos: model.state_dict() for pos, model in player_models.items()}
+        }, "hierarchical_draft_agent.pth")
+        print("\n✓ Saved best-performing models to hierarchical_draft_agent.pth")
 
-    return model, all_scores, all_ranks, all_rewards, restart_episodes
+    return position_model, player_models, all_scores, all_ranks, all_rewards
 
 
 # ============================================================================
@@ -636,8 +608,8 @@ def train_pure_performance_restarts(
 # ============================================================================
 
 
-def plot_training(scores, ranks, rewards, restart_points):
-    """Plot with restart points marked"""
+def plot_training(scores, ranks, rewards):
+    """Plot training curves"""
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -647,10 +619,6 @@ def plot_training(scores, ranks, rewards, restart_points):
     if len(scores) >= 100:
         ma = pd.Series(scores).rolling(100).mean()
         ax.plot(ma, linewidth=2.5, label="100-Ep MA")
-
-    for i, restart_ep in enumerate(restart_points):
-        ax.axvline(x=restart_ep, linestyle="--", linewidth=2, label="Restart" if i == 0 else "")
-
     ax.set_xlabel("Episode")
     ax.set_ylabel("Score")
     ax.set_title("Episode Scores")
@@ -695,33 +663,26 @@ def plot_training(scores, ranks, rewards, restart_points):
 
 
 def main():
-    """Pure RL with performance-based restarts"""
+    """Train hierarchical agent"""
 
     print("\n" + "=" * 80)
-    print("PURE RL - Performance-Based Restarts")
+    print("HIERARCHICAL RL - Position + Player Policies")
     print("=" * 80)
 
     print("\n[STEP 1/2] Training")
     print("This will take a bit for 5000 episodes...\n")
 
-    model, scores, ranks, rewards, restarts = train_pure_performance_restarts(
+    position_model, player_models, scores, ranks, rewards = train_hierarchical_agent(
         total_episodes=5000,
-        restart_check_window=300,
-        score_threshold=1800,
-        max_restarts=5,
         learning_rate=1e-3,
     )
 
     print("\n[STEP 2/2] Plotting training curves...")
-    plot_training(scores, ranks, rewards, restarts)
+    plot_training(scores, ranks, rewards)
 
     print("\n" + "=" * 80)
-    print("✓ PURE RL TRAINING COMPLETE!")
+    print("✓ HIERARCHICAL RL TRAINING COMPLETE!")
     print("=" * 80)
-    print(f"\nRestarts: {len(restarts)}")
-    if restarts:
-        print(f"Restart episodes: {restarts}")
-    print("\nNext: python analyze_policy.py")
 
 
 if __name__ == "__main__":
