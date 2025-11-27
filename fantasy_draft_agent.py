@@ -106,21 +106,30 @@ class DraftEnvironment:
         )
 
         # Use actual 2024 fantasy_points_ppr for scoring
-        df_draft['fantasy_points_ppr'] = df_draft['fantasy_points_ppr'].fillna(0.0)
+        df_draft["fantasy_points_ppr"] = df_draft["fantasy_points_ppr"].fillna(0.0)
 
         self.player_pool = df_draft
-        
+
         # Define which columns to use as player features
         self.feature_columns = [
-            'fantasy_adp', 'age', 'is_rookie', 'team_win_pct_weighted',
-            'avg_points_per_game', 'avg_games', 'avg_rushing_yards',
-            'avg_rushing_tds', 'avg_receptions', 'avg_receiving_yards',
-            'avg_receiving_tds', 'avg_passing_yards', 'avg_passing_tds'
+            "fantasy_adp",
+            "age",
+            "is_rookie",
+            "team_win_pct_weighted",
+            "avg_points_per_game",
+            "avg_games",
+            "avg_rushing_yards",
+            "avg_rushing_tds",
+            "avg_receptions",
+            "avg_receiving_yards",
+            "avg_receiving_tds",
+            "avg_passing_yards",
+            "avg_passing_tds",
         ]
-        
+
         # Normalize features for neural network
         self._normalize_features()
-        
+
         self.reset()
         print(f"[Environment] Loaded {len(df_draft)} players for drafting")
         print(f"[Environment] Using actual 2024 stats for scoring")
@@ -133,9 +142,9 @@ class DraftEnvironment:
                 min_val = col_data.min()
                 max_val = col_data.max()
                 if max_val > min_val:
-                    self.player_pool[f'{col}_norm'] = (col_data - min_val) / (max_val - min_val)
+                    self.player_pool[f"{col}_norm"] = (col_data - min_val) / (max_val - min_val)
                 else:
-                    self.player_pool[f'{col}_norm'] = 0.0
+                    self.player_pool[f"{col}_norm"] = 0.0
 
     def get_player_features(self, player_row: pd.Series, position: str) -> np.ndarray:
         """
@@ -152,7 +161,7 @@ class DraftEnvironment:
             features = get_te_features(player_row, self)
         else:
             features = []
-        
+
         return np.array(features, dtype=np.float32)
 
     def _get_position_from_onehot(self, row):
@@ -200,7 +209,8 @@ class DraftEnvironment:
         needs = {}
         for pos in ["QB", "RB", "WR", "TE"]:
             needs[pos] = max(
-                0, self.starting_requirements[pos] - self.roster_counts[team_id][pos]
+                0,
+                self.starting_requirements[pos] - self.roster_counts[team_id][pos],
             )
         total_needed = 8
         filled = sum(self.roster_counts[team_id].values())
@@ -311,11 +321,11 @@ class DraftEnvironment:
         """Get all available players at a position that this team can draft"""
         if not self.can_draft_position(team_id, position):
             return []
-        
+
         available = self.get_available_players()
         if available.empty:
             return []
-        
+
         avail_pos = available[available["position"] == position]
         return [row for _, row in avail_pos.iterrows()]
 
@@ -339,106 +349,114 @@ class HierarchicalDraftAgent:
         self.position_model = position_model
         self.player_models = player_models  # {"QB": model, "RB": model, ...}
         self.device = next(position_model.parameters()).device
-        
+
         self.positions = ["QB", "RB", "WR", "TE"]
         self.pos_to_idx = {p: i for i, p in enumerate(self.positions)}
 
-    def pick_player(self, env, team_id: int, round_num: int, epsilon: float, training: bool = True):
+    def pick_player(
+        self, env, team_id: int, round_num: int, epsilon: float, training: bool = True
+    ):
         """
         Two-stage pick:
         1. Choose position using position_model
         2. Choose specific player at that position using player_models[position]
         """
         context = env.get_context_vector(team_id, round_num)
-        context_tensor = torch.tensor(context, dtype=torch.float32, device=self.device).unsqueeze(0)
-        
+        context_tensor = torch.tensor(
+            context, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+
         # STAGE 1: Choose position
         legal_positions = []
         legal_indices = []
-        
+
         for pos in self.positions:
             if env.get_available_at_position(team_id, pos):
                 legal_positions.append(pos)
                 legal_indices.append(self.pos_to_idx[pos])
-        
+
         if not legal_positions:
             return None, None, None
-        
+
         # Get position scores
         if training:
             self.position_model.train()
         else:
             self.position_model.eval()
-        
+
         with torch.set_grad_enabled(training):
             position_logits = self.position_model(context_tensor).squeeze(0)  # [4]
-            
+
             # Mask illegal positions
-            legal_mask = torch.full((4,), float('-inf'), device=self.device)
+            legal_mask = torch.full((4,), float("-inf"), device=self.device)
             for idx in legal_indices:
                 legal_mask[idx] = 0.0
-            
+
             masked_logits = position_logits + legal_mask
             position_probs = torch.softmax(masked_logits, dim=0)
-            
+
             # ε-greedy position selection
             if training and random.random() < epsilon:
                 chosen_pos_idx = random.choice(legal_indices)
             else:
                 chosen_pos_idx = int(torch.argmax(position_probs).item())
-            
-            position_log_prob = torch.log(position_probs[chosen_pos_idx] + 1e-10) if training else None
-        
+
+            position_log_prob = (
+                torch.log(position_probs[chosen_pos_idx] + 1e-10) if training else None
+            )
+
         chosen_position = self.positions[chosen_pos_idx]
-        
+
         # STAGE 2: Choose specific player at that position
         available_players = env.get_available_at_position(team_id, chosen_position)
-        
+
         if not available_players:
             return None, None, None
-        
+
         # Get player features for all available players at this position
         player_features = []
         for player_row in available_players:
             feat = env.get_player_features(player_row, chosen_position)
             player_features.append(feat)
-        
+
         player_features_tensor = torch.tensor(
             np.stack(player_features),
             dtype=torch.float32,
-            device=self.device
+            device=self.device,
         )
-        
+
         # Repeat context for each player
         context_batch = context_tensor.repeat(len(available_players), 1)
-        
+
         # Get player values from position-specific model
         player_model = self.player_models[chosen_position]
-        
+
         if training:
             player_model.train()
         else:
             player_model.eval()
-        
+
         with torch.set_grad_enabled(training):
             player_values = player_model(player_features_tensor, context_batch).squeeze(1)
             player_probs = torch.softmax(player_values, dim=0)
-            
+
             # ε-greedy player selection
             if training and random.random() < epsilon:
                 player_idx = random.randrange(len(available_players))
             else:
                 player_idx = int(torch.argmax(player_probs).item())
-            
-            player_log_prob = torch.log(player_probs[player_idx] + 1e-10) if training else None
-        
+
+            player_log_prob = (
+                torch.log(player_probs[player_idx] + 1e-10) if training else None
+            )
+
         chosen_player = available_players[player_idx]
-        
+
         # Combine log probs for total action probability
         total_log_prob = None
         if training and position_log_prob is not None and player_log_prob is not None:
             total_log_prob = position_log_prob + player_log_prob
-        
+
         return chosen_player, total_log_prob, chosen_position
 
 
@@ -448,7 +466,7 @@ class HierarchicalDraftAgent:
 
 
 def train_hierarchical_agent(
-    total_episodes=5000,
+    total_episodes=2,
     learning_rate=1e-3,
 ):
     """Train hierarchical agent with position + player policies"""
@@ -478,34 +496,37 @@ def train_hierarchical_agent(
 
     # Create networks - each position has its own architecture and features
     position_model = PositionPolicyNetwork(context_size=10).to(device)
-    
+
     # Get feature sizes for each position (may be different!)
-    sample_qb = env.player_pool[env.player_pool['position'] == 'QB'].iloc[0]
-    sample_rb = env.player_pool[env.player_pool['position'] == 'RB'].iloc[0]
-    sample_wr = env.player_pool[env.player_pool['position'] == 'WR'].iloc[0]
-    sample_te = env.player_pool[env.player_pool['position'] == 'TE'].iloc[0]
-    
+    sample_qb = env.player_pool[env.player_pool["position"] == "QB"].iloc[0]
+    sample_rb = env.player_pool[env.player_pool["position"] == "RB"].iloc[0]
+    sample_wr = env.player_pool[env.player_pool["position"] == "WR"].iloc[0]
+    sample_te = env.player_pool[env.player_pool["position"] == "TE"].iloc[0]
+
     qb_feature_size = len(get_qb_features(sample_qb, env))
     rb_feature_size = len(get_rb_features(sample_rb, env))
     wr_feature_size = len(get_wr_features(sample_wr, env))
     te_feature_size = len(get_te_features(sample_te, env))
-    
-    print(f"Feature sizes: QB={qb_feature_size}, RB={rb_feature_size}, WR={wr_feature_size}, TE={te_feature_size}")
-    
+
+    print(
+        f"Feature sizes: QB={qb_feature_size}, RB={rb_feature_size}, "
+        f"WR={wr_feature_size}, TE={te_feature_size}"
+    )
+
     player_models = {
         "QB": QBPlayerNetwork(qb_feature_size, context_size=10).to(device),
         "RB": RBPlayerNetwork(rb_feature_size, context_size=10).to(device),
         "WR": WRPlayerNetwork(wr_feature_size, context_size=10).to(device),
         "TE": TEPlayerNetwork(te_feature_size, context_size=10).to(device),
     }
-    
+
     # Separate optimizers for each network
     position_optimizer = optim.Adam(position_model.parameters(), lr=learning_rate)
     player_optimizers = {
         pos: optim.Adam(model.parameters(), lr=learning_rate)
         for pos, model in player_models.items()
     }
-    
+
     agent = HierarchicalDraftAgent(position_model, player_models)
 
     all_scores = []
@@ -527,7 +548,9 @@ def train_hierarchical_agent(
 
             for tid in order:
                 if tid == our_team:
-                    player, log_prob, position = agent.pick_player(env, tid, rnd, epsilon, training=True)
+                    player, log_prob, position = agent.pick_player(
+                        env, tid, rnd, epsilon, training=True
+                    )
                     if player is not None:
                         env.make_pick(tid, player)
                         if log_prob is not None:
@@ -553,13 +576,13 @@ def train_hierarchical_agent(
             position_optimizer.zero_grad()
             for opt in player_optimizers.values():
                 opt.zero_grad()
-            
+
             loss.backward()
-            
+
             nn.utils.clip_grad_norm_(position_model.parameters(), 5.0)
             for model in player_models.values():
                 nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            
+
             position_optimizer.step()
             for opt in player_optimizers.values():
                 opt.step()
@@ -585,25 +608,194 @@ def train_hierarchical_agent(
             if recent_avg > best_avg_score:
                 best_avg_score = recent_avg
                 best_models = {
-                    'position': copy.deepcopy(position_model.state_dict()),
-                    'players': {pos: copy.deepcopy(model.state_dict()) 
-                               for pos, model in player_models.items()}
+                    "position": copy.deepcopy(position_model.state_dict()),
+                    "players": {
+                        pos: copy.deepcopy(model.state_dict())
+                        for pos, model in player_models.items()
+                    },
                 }
 
     print("\nTraining complete.")
 
     if best_models is not None:
-        position_model.load_state_dict(best_models['position'])
-        for pos, state in best_models['players'].items():
+        position_model.load_state_dict(best_models["position"])
+        for pos, state in best_models["players"].items():
             player_models[pos].load_state_dict(state)
-        
-        torch.save({
-            'position_model': position_model.state_dict(),
-            'player_models': {pos: model.state_dict() for pos, model in player_models.items()}
-        }, "hierarchical_draft_agent.pth")
+
+        torch.save(
+            {
+                "position_model": position_model.state_dict(),
+                "player_models": {
+                    pos: model.state_dict() for pos, model in player_models.items()
+                },
+            },
+            "hierarchical_draft_agent.pth",
+        )
         print("\n✓ Saved best-performing models to hierarchical_draft_agent.pth")
 
-    return position_model, player_models, all_scores, all_ranks, all_rewards
+    # NOTE: now we also return the env so we can inspect policy later
+    return position_model, player_models, env, all_scores, all_ranks, all_rewards
+
+
+# ============================================================================
+# POLICY INSPECTION (ROUND-LEVEL + PLAYER PREFERENCES)
+# ============================================================================
+
+
+def print_learned_policy(position_model, player_models, env, device):
+    """
+    Print a human-readable snapshot of the learned policy:
+    - Position probabilities by round for a mid-draft team
+    - Top players by position according to each player network
+    """
+    position_model.eval()
+    for m in player_models.values():
+        m.eval()
+
+    print("\n" + "=" * 80)
+    print("LEARNED POSITION POLICY (probabilities by round, mid-slot team)")
+    print("=" * 80)
+
+    # Use a "middle" draft slot as an example (e.g., pick 6 of 12)
+    team_id = env.n_teams // 2
+    env.reset(our_team_id=team_id)
+
+    with torch.no_grad():
+        for rnd in range(1, env.n_rounds + 1):
+            env.current_round = rnd
+            ctx = env.get_context_vector(team_id, rnd)
+            ctx_tensor = torch.tensor(
+                ctx, dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            logits = position_model(ctx_tensor).squeeze(0)
+            probs = torch.softmax(logits, dim=0).cpu().numpy()
+
+            print(
+                f"Round {rnd}: "
+                f"QB={probs[0]:.2f}, RB={probs[1]:.2f}, "
+                f"WR={probs[2]:.2f}, TE={probs[3]:.2f}"
+            )
+
+    print("\n" + "=" * 80)
+    print("LEARNED PLAYER PREFERENCES (top players per position)")
+    print("=" * 80)
+
+    # Use a simple "round 1, all needs open" context for player ranking
+    env.reset(our_team_id=team_id)
+    env.current_round = 1
+    ctx = env.get_context_vector(team_id, 1)
+    ctx_tensor = torch.tensor(ctx, dtype=torch.float32, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        for pos in ["QB", "RB", "WR", "TE"]:
+            model = player_models[pos]
+            # Take top N by ADP at this position
+            candidates_df = env.player_pool[env.player_pool["position"] == pos].copy()
+            candidates_df = candidates_df.sort_values("fantasy_adp").head(40)
+
+            if candidates_df.empty:
+                print(f"\nNo candidates found for position {pos}")
+                continue
+
+            player_feats = []
+            names = []
+            adps = []
+
+            for _, row in candidates_df.iterrows():
+                feats = env.get_player_features(row, pos)
+                player_feats.append(feats)
+                names.append(f"{row['first_name']} {row['last_name']}")
+                adps.append(row["fantasy_adp"])
+
+            feat_tensor = torch.tensor(
+                np.stack(player_feats), dtype=torch.float32, device=device
+            )
+            ctx_batch = ctx_tensor.repeat(len(names), 1)
+            values = model(feat_tensor, ctx_batch).squeeze(1).cpu().numpy()
+            order = np.argsort(-values)
+
+            print(f"\nTop {min(10, len(order))} {pos}s according to the learned player policy:")
+            for i in range(min(10, len(order))):
+                idx = order[i]
+                print(
+                    f"  {i+1:2d}. {names[idx]:25s} "
+                    f"value={values[idx]:7.3f}  ADP={adps[idx]:6.1f}"
+                )
+
+
+# ============================================================================
+# POLICY MATRIX (ROUND × PICK × POSITION)
+# ============================================================================
+
+
+def compute_position_policy_matrix(position_model, env, device):
+    """
+    Compute a [n_rounds x n_teams x 4] matrix of position probabilities.
+
+    For each round and each pick slot (draft order position), we:
+      - Assume an empty roster (env.reset(...) each time)
+      - Build the context vector for that team in that round
+      - Run the position_model to get P(QB/RB/WR/TE)
+
+    Returns:
+        probs_matrix: np.ndarray of shape [n_rounds, n_teams, 4]
+                      probs_matrix[r, p, :] = [P(QB), P(RB), P(WR), P(TE)]
+        positions:    list of position labels in order used above
+    """
+    position_model.eval()
+    n_rounds = env.n_rounds
+    n_teams = env.n_teams
+    positions = ["QB", "RB", "WR", "TE"]
+
+    probs_matrix = np.zeros((n_rounds, n_teams, 4), dtype=np.float32)
+
+    with torch.no_grad():
+        for rnd in range(1, n_rounds + 1):
+            env.current_round = rnd
+            order = env.get_draft_order(rnd)  # snake order for that round
+
+            # pick_idx is 0..n_teams-1 in actual pick order
+            for pick_idx, team_id in enumerate(order):
+                # Reset env so roster/needs are "empty" for this diagnostic
+                env.reset(our_team_id=team_id)
+                env.current_round = rnd
+
+                ctx = env.get_context_vector(team_id, rnd)
+                ctx_tensor = torch.tensor(
+                    ctx, dtype=torch.float32, device=device
+                ).unsqueeze(0)  # [1, context_size]
+
+                logits = position_model(ctx_tensor).squeeze(0)  # [4]
+                probs = torch.softmax(logits, dim=0).cpu().numpy()  # [4]
+
+                probs_matrix[rnd - 1, pick_idx, :] = probs
+
+    return probs_matrix, positions
+
+
+def print_position_policy_matrix(probs_matrix, positions):
+    """
+    Nicely print the [round x pick x position] probabilities.
+
+    probs_matrix[r, p, k] = P(position_k) at round r+1, pick index p+1.
+    """
+    n_rounds, n_picks, _ = probs_matrix.shape
+
+    print("\n" + "=" * 80)
+    print("LEARNED POSITION POLICY BY ROUND AND PICK (STATIC, EMPTY ROSTERS)")
+    print("Rows = rounds, Columns = picks in that round (snake-order index)")
+    print("Each line shows: QB/RB/WR/TE probabilities.")
+    print("=" * 80 + "\n")
+
+    for r in range(n_rounds):
+        print(f"Round {r+1}:")
+        for p in range(n_picks):
+            qb, rb, wr, te = probs_matrix[r, p, :]
+            print(
+                f"  Pick {p+1:2d}: "
+                f"QB={qb:0.2f}, RB={rb:0.2f}, WR={wr:0.2f}, TE={te:0.2f}"
+            )
+        print()
 
 
 # ============================================================================
@@ -672,16 +864,31 @@ def main():
     print("HIERARCHICAL RL - Position + Player Policies")
     print("=" * 80)
 
-    print("\n[STEP 1/2] Training")
-    print("This will take a bit for 5000 episodes...\n")
+    print("\n[STEP 1/4] Training")
+    print("This will take a bit for more episodes...\n")
 
-    position_model, player_models, scores, ranks, rewards = train_hierarchical_agent(
-        total_episodes=5000,
+    (
+        position_model,
+        player_models,
+        env,
+        scores,
+        ranks,
+        rewards,
+    ) = train_hierarchical_agent(
+        total_episodes=2,      # bump this for real training
         learning_rate=1e-3,
     )
 
-    print("\n[STEP 2/2] Plotting training curves...")
+    print("\n[STEP 2/4] Plotting training curves...")
     plot_training(scores, ranks, rewards)
+
+    print("\n[STEP 3/4] Inspecting learned policy (positions + players)...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print_learned_policy(position_model, player_models, env, device)
+
+    print("\n[STEP 4/4] Computing position policy matrix (round × pick × position)...")
+    probs_matrix, positions = compute_position_policy_matrix(position_model, env, device)
+    print_position_policy_matrix(probs_matrix, positions)
 
     print("\n" + "=" * 80)
     print("✓ HIERARCHICAL RL TRAINING COMPLETE!")
