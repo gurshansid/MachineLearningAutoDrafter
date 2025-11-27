@@ -17,6 +17,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import os
+import time
 
 
 # ============================================================================
@@ -70,42 +72,55 @@ class ContextAwarePlayerValueNetwork(nn.Module):
 
 
 class DraftEnvironment:
-    def __init__(self, draft_data_path: str, scoring_data_path: str, n_teams=12, n_rounds=8, seed=42):
+    def __init__(
+        self,
+        draft_data_path: str,
+        scoring_data_path: str,
+        n_teams: int = 12,
+        n_rounds: int = 8,
+        seed: Optional[int] = None,
+    ):
         self.n_teams = n_teams
         self.n_rounds = n_rounds
-        self.rng = random.Random(seed)
+
+        if seed is not None:
+            self.rng = random.Random(seed)
+            print(f"[Env] Using env RNG seed: {seed}")
+        else:
+            self.rng = random.Random()
+            print("[Env] Using unseeded env RNG")
 
         self.roster_limits = {"QB": 2, "RB": 5, "WR": 5, "TE": 3}
         self.starting_requirements = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
 
         # Load condensed CSV for drafting (with ADP)
         df_draft = pd.read_csv(draft_data_path)
-        
+
         # Convert position one-hot columns to a single 'position' column
-        if 'pos_qb' in df_draft.columns:
-            df_draft['position'] = df_draft.apply(self._get_position_from_onehot, axis=1)
-        
+        if "pos_qb" in df_draft.columns:
+            df_draft["position"] = df_draft.apply(self._get_position_from_onehot, axis=1)
+
         # Filter and sort by ADP
         df_draft = df_draft[df_draft["position"].isin(["QB", "RB", "WR", "TE"])].copy()
         df_draft = df_draft[df_draft["fantasy_adp"] < 300].copy()
         df_draft = df_draft.sort_values("fantasy_adp").reset_index(drop=True)
-        
+
         # Load actual 2024 stats for scoring
         df_scoring = pd.read_csv(scoring_data_path)
         df_scoring = df_scoring[df_scoring["position"].isin(["QB", "RB", "WR", "TE"])].copy()
-        
+
         # Merge scoring data into draft data
         # Match on first_name and last_name
         df_draft = df_draft.merge(
-            df_scoring[['first_name', 'last_name', 'fantasy_points_ppr']],
-            on=['first_name', 'last_name'],
-            how='left',
-            suffixes=('', '_actual')
+            df_scoring[["first_name", "last_name", "fantasy_points_ppr"]],
+            on=["first_name", "last_name"],
+            how="left",
+            suffixes=("", "_actual"),
         )
-        
+
         # Use actual 2024 fantasy_points_ppr for scoring
         # If no match found, use a default low score
-        df_draft['fantasy_points_ppr'] = df_draft['fantasy_points_ppr'].fillna(0.0)
+        df_draft["fantasy_points_ppr"] = df_draft["fantasy_points_ppr"].fillna(0.0)
 
         self.player_pool = df_draft
         self.reset()
@@ -114,38 +129,51 @@ class DraftEnvironment:
 
     def _get_position_from_onehot(self, row):
         """Convert one-hot position columns to single position string"""
-        if row.get('pos_qb', 0) == 1:
-            return 'QB'
-        elif row.get('pos_rb', 0) == 1:
-            return 'RB'
-        elif row.get('pos_wr', 0) == 1:
-            return 'WR'
-        elif row.get('pos_te', 0) == 1:
-            return 'TE'
-        return 'UNKNOWN'
+        if row.get("pos_qb", 0) == 1:
+            return "QB"
+        elif row.get("pos_rb", 0) == 1:
+            return "RB"
+        elif row.get("pos_wr", 0) == 1:
+            return "WR"
+        elif row.get("pos_te", 0) == 1:
+            return "TE"
+        return "UNKNOWN"
 
     def reset(self, our_team_id: Optional[int] = None):
-        self.our_team_id = our_team_id if our_team_id is not None else self.rng.randint(0, self.n_teams - 1)
+        self.our_team_id = (
+            our_team_id if our_team_id is not None else self.rng.randint(0, self.n_teams - 1)
+        )
         self.current_round = 1
         self.draft_history = []
         self.rosters = {tid: [] for tid in range(self.n_teams)}
-        self.roster_counts = {tid: {pos: 0 for pos in self.roster_limits.keys()} for tid in range(self.n_teams)}
+        self.roster_counts = {
+            tid: {pos: 0 for pos in self.roster_limits.keys()} for tid in range(self.n_teams)
+        }
         return self.our_team_id
 
     def get_draft_order(self, round_num: int):
-        return list(range(self.n_teams)) if round_num % 2 == 1 else list(range(self.n_teams - 1, -1, -1))
+        return (
+            list(range(self.n_teams))
+            if round_num % 2 == 1
+            else list(range(self.n_teams - 1, -1, -1))
+        )
 
     def get_available_players(self):
         taken = {p["player_index"] for p in self.draft_history}
         return self.player_pool[~self.player_pool.index.isin(taken)]
 
     def can_draft_position(self, team_id: int, position: str):
-        return position in self.roster_limits and self.roster_counts[team_id][position] < self.roster_limits[position]
+        return (
+            position in self.roster_limits
+            and self.roster_counts[team_id][position] < self.roster_limits[position]
+        )
 
     def get_roster_needs(self, team_id: int):
         needs = {}
         for pos in ["QB", "RB", "WR", "TE"]:
-            needs[pos] = max(0, self.starting_requirements[pos] - self.roster_counts[team_id][pos])
+            needs[pos] = max(
+                0, self.starting_requirements[pos] - self.roster_counts[team_id][pos]
+            )
         total_needed = 8
         filled = sum(self.roster_counts[team_id].values())
         needs["FLEX"] = max(0, total_needed - filled)
@@ -195,7 +223,11 @@ class DraftEnvironment:
         available = self.get_available_players()
         if available.empty:
             return None
-        legal = [row for _, row in available.iterrows() if self.can_draft_position(team_id, row["position"])]
+        legal = [
+            row
+            for _, row in available.iterrows()
+            if self.can_draft_position(team_id, row["position"])
+        ]
         if not legal:
             return None
         return pd.DataFrame(legal).sort_values("fantasy_adp").iloc[0]
@@ -222,7 +254,12 @@ class DraftEnvironment:
                 lineup[pos].append(p)
                 used.add(p.name)
 
-        flex_cands = [p for pos in ["RB", "WR", "TE"] for p in by_pos[pos] if p.name not in used]
+        flex_cands = [
+            p
+            for pos in ["RB", "WR", "TE"]
+            for p in by_pos[pos]
+            if p.name not in used
+        ]
         flex_cands.sort(key=lambda x: x["fantasy_points_ppr"], reverse=True)
         for p in flex_cands[:2]:
             lineup["FLEX"].append(p)
@@ -236,7 +273,11 @@ class DraftEnvironment:
 
     def team_score(self, team_id: int):
         lineup = self.build_starting_lineup(team_id)
-        return sum(float(p["fantasy_points_ppr"]) for pos in ["QB", "RB", "WR", "TE", "FLEX"] for p in lineup[pos])
+        return sum(
+            float(p["fantasy_points_ppr"])
+            for pos in ["QB", "RB", "WR", "TE", "FLEX"]
+            for p in lineup[pos]
+        )
 
     def position_available_for_team(self, team_id: int, position: str) -> bool:
         """
@@ -436,12 +477,16 @@ def train_pure_performance_restarts(
     # [QB, RB, WR, TE]
     player_feature_size = 4
 
+    # Use a derived env seed so runs are reproducible given the base seed,
+    # but different across separate runs when the base seed changes.
+    env_seed = random.randint(0, 1_000_000_000)
+    print(f"[SEED] Using env seed: {env_seed}")
     env = DraftEnvironment(
         draft_data_path="nfl_players_condensed.csv",
         scoring_data_path="nfl_players_2024_stats.csv",
         n_teams=12,
         n_rounds=8,
-        seed=42
+        seed=env_seed,
     )
 
     all_scores = []
@@ -680,7 +725,18 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    # Optional: allow an explicit base seed via env var
+    env_seed_var = os.environ.get("FF_SEED")
+    if env_seed_var is not None:
+        base_seed = int(env_seed_var)
+        print(f"[SEED] Using provided base seed from FF_SEED: {base_seed}")
+    else:
+        base_seed = int(time.time_ns() % (2**31 - 1))
+        print(f"[SEED] Using time-based base seed: {base_seed}")
+
+    # Deterministic behavior within this run
+    torch.manual_seed(base_seed)
+    np.random.seed(base_seed)
+    random.seed(base_seed)
+
     main()
