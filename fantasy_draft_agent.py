@@ -7,7 +7,6 @@ No assumptions about QB/RB/WR strategy at all
 Agent must discover everything from scratch through experience
 """
 
-import os
 import copy
 import random
 from typing import Optional
@@ -71,7 +70,7 @@ class ContextAwarePlayerValueNetwork(nn.Module):
 
 
 class DraftEnvironment:
-    def __init__(self, player_data_path: str, n_teams=12, n_rounds=8, seed=42):
+    def __init__(self, draft_data_path: str, scoring_data_path: str, n_teams=12, n_rounds=8, seed=42):
         self.n_teams = n_teams
         self.n_rounds = n_rounds
         self.rng = random.Random(seed)
@@ -79,14 +78,51 @@ class DraftEnvironment:
         self.roster_limits = {"QB": 2, "RB": 5, "WR": 5, "TE": 3}
         self.starting_requirements = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
 
-        df = pd.read_csv(player_data_path)
-        df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
-        df = df[df["fantasy_adp"] < 300].copy()
-        df = df.sort_values("fantasy_adp").reset_index(drop=True)
+        # Load condensed CSV for drafting (with ADP)
+        df_draft = pd.read_csv(draft_data_path)
+        
+        # Convert position one-hot columns to a single 'position' column
+        if 'pos_qb' in df_draft.columns:
+            df_draft['position'] = df_draft.apply(self._get_position_from_onehot, axis=1)
+        
+        # Filter and sort by ADP
+        df_draft = df_draft[df_draft["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+        df_draft = df_draft[df_draft["fantasy_adp"] < 300].copy()
+        df_draft = df_draft.sort_values("fantasy_adp").reset_index(drop=True)
+        
+        # Load actual 2024 stats for scoring
+        df_scoring = pd.read_csv(scoring_data_path)
+        df_scoring = df_scoring[df_scoring["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+        
+        # Merge scoring data into draft data
+        # Match on first_name and last_name
+        df_draft = df_draft.merge(
+            df_scoring[['first_name', 'last_name', 'fantasy_points_ppr']],
+            on=['first_name', 'last_name'],
+            how='left',
+            suffixes=('', '_actual')
+        )
+        
+        # Use actual 2024 fantasy_points_ppr for scoring
+        # If no match found, use a default low score
+        df_draft['fantasy_points_ppr'] = df_draft['fantasy_points_ppr'].fillna(0.0)
 
-        self.player_pool = df
+        self.player_pool = df_draft
         self.reset()
-        print(f"[Environment] Loaded {len(df)} players")
+        print(f"[Environment] Loaded {len(df_draft)} players for drafting")
+        print(f"[Environment] Using actual 2024 stats for scoring")
+
+    def _get_position_from_onehot(self, row):
+        """Convert one-hot position columns to single position string"""
+        if row.get('pos_qb', 0) == 1:
+            return 'QB'
+        elif row.get('pos_rb', 0) == 1:
+            return 'RB'
+        elif row.get('pos_wr', 0) == 1:
+            return 'WR'
+        elif row.get('pos_te', 0) == 1:
+            return 'TE'
+        return 'UNKNOWN'
 
     def reset(self, our_team_id: Optional[int] = None):
         self.our_team_id = our_team_id if our_team_id is not None else self.rng.randint(0, self.n_teams - 1)
@@ -400,7 +436,13 @@ def train_pure_performance_restarts(
     # [QB, RB, WR, TE]
     player_feature_size = 4
 
-    env = DraftEnvironment("nfl_players_2024_stats.csv", n_teams=12, n_rounds=8, seed=42)
+    env = DraftEnvironment(
+        draft_data_path="nfl_players_condensed.csv",
+        scoring_data_path="nfl_players_2024_stats.csv",
+        n_teams=12,
+        n_rounds=8,
+        seed=42
+    )
 
     all_scores = []
     all_ranks = []
@@ -603,87 +645,6 @@ def plot_training(scores, ranks, rewards, restart_points):
 
 
 # ============================================================================
-# CONDENSED FEATURE BUILD (NOT USED BY POSITION POLICY, BUT KEPT/FIXED)
-# ============================================================================
-
-
-def rebuild_condensed():
-    """
-    Rebuild condensed features CSV from raw player data.
-
-    The new position-policy agent does not use this file directly,
-    but we keep it around for compatibility with other scripts.
-    """
-    if not os.path.exists("nfl_players_2024_stats.csv") or not os.path.exists(
-        "nfl_player_data_with_history.csv"
-    ):
-        print("Skipping rebuild_condensed(): missing data files.")
-        return
-
-    df_2024 = pd.read_csv("nfl_players_2024_stats.csv")
-    df_2023 = pd.read_csv("nfl_player_data_with_history.csv")
-
-    df_2024 = df_2024[df_2024["position"].isin(["QB", "RB", "WR", "TE"])].copy()
-    df_2024 = df_2024[df_2024["fantasy_adp"] < 300].copy()
-
-    merge_keys = ["first_name", "last_name"]
-
-    condensed = df_2024[merge_keys + ["team", "position", "fantasy_adp", "fantasy_points_ppr"]].copy()
-
-    stats_cols = [
-        "games",
-        "rushing_yards",
-        "rushing_tds",
-        "receiving_yards",
-        "receiving_tds",
-        "targets",
-        "receptions",
-        "passing_yards",
-        "passing_tds",
-        "interceptions",
-        "fantasy_points_ppr",
-    ]
-
-    available = [c for c in stats_cols if c in df_2023.columns]
-    df_2023_sub = df_2023[merge_keys + available].copy()
-    df_2023_sub = df_2023_sub.rename(columns={c: f"{c}_2023" for c in available})
-
-    condensed = condensed.merge(df_2023_sub, on=merge_keys, how="left")
-
-    for col in condensed.columns:
-        if col.endswith("_2023"):
-            condensed[col] = condensed[col].fillna(0.0)
-
-    # SAFE rookie flag: use games_2023 or fantasy_points_ppr_2023 if present
-    if "games_2023" in condensed.columns:
-        condensed["is_rookie"] = (condensed["games_2023"] == 0).astype(int)
-    elif "fantasy_points_ppr_2023" in condensed.columns:
-        condensed["is_rookie"] = (condensed["fantasy_points_ppr_2023"] == 0).astype(int)
-    else:
-        condensed["is_rookie"] = 0
-
-    condensed["pos_QB"] = (condensed["position"] == "QB").astype(int)
-    condensed["pos_RB"] = (condensed["position"] == "RB").astype(int)
-    condensed["pos_WR"] = (condensed["position"] == "WR").astype(int)
-    condensed["pos_TE"] = (condensed["position"] == "TE").astype(int)
-
-    if "games_2023" in condensed.columns and "fantasy_points_ppr_2023" in condensed.columns:
-        condensed["ppg_2023"] = np.where(
-            condensed["games_2023"] > 0,
-            condensed["fantasy_points_ppr_2023"] / condensed["games_2023"],
-            0.0,
-        )
-    else:
-        condensed["ppg_2023"] = 0.0
-
-    condensed["adp_normalized"] = condensed["fantasy_adp"] / 300.0
-    condensed = condensed.drop(columns=["position"])
-
-    condensed.to_csv("nfl_players_condensed.csv", index=False)
-    print("✓ Rebuilt condensed features\n")
-
-
-# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -695,10 +656,7 @@ def main():
     print("PURE RL - Performance-Based Restarts")
     print("=" * 80)
 
-    print("\n[STEP 1/3] Rebuilding Features (for compatibility)")
-    rebuild_condensed()
-
-    print("[STEP 2/3] Training")
+    print("\n[STEP 1/2] Training")
     print("This will take a bit for 5000 episodes...\n")
 
     model, scores, ranks, rewards, restarts = train_pure_performance_restarts(
@@ -709,7 +667,7 @@ def main():
         learning_rate=1e-3,
     )
 
-    print("\n[STEP 3/3] Plotting training curves...")
+    print("\n[STEP 2/2] Plotting training curves...")
     plot_training(scores, ranks, rewards, restarts)
 
     print("\n" + "=" * 80)
