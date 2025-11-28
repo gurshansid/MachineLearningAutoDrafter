@@ -431,6 +431,31 @@ class DraftEnvironment:
 
 
 # ============================================================================
+# ROSTER PRINTING HELPER
+# ============================================================================
+
+def print_agent_roster(env: DraftEnvironment, team_id: int):
+    """Pretty-print the agent's roster for the current draft."""
+    lineup = env.build_starting_lineup(team_id)
+
+    print("  Starters:")
+    for pos in ["QB", "RB", "WR", "TE", "FLEX"]:
+        for p in lineup[pos]:
+            name = f"{p['first_name']} {p['last_name']}"
+            pts = float(p["fantasy_points_ppr"])
+            adp = float(p["fantasy_adp"])
+            print(f"    {pos:<5} {name:<25} PPR={pts:6.1f}  ADP={adp:6.1f}")
+
+    if lineup["BENCH"]:
+        print("  Bench:")
+        for p in lineup["BENCH"]:
+            name = f"{p['first_name']} {p['last_name']}"
+            pts = float(p["fantasy_points_ppr"])
+            adp = float(p["fantasy_adp"])
+            print(f"    BENCH {name:<25} PPR={pts:6.1f}  ADP={adp:6.1f}")
+
+
+# ============================================================================
 # HIERARCHICAL AGENT
 # ============================================================================
 
@@ -718,6 +743,11 @@ def train(total_episodes=5000, learning_rate=1e-3):
                 f"ε:{epsilon:.3f}"
             )
 
+            # NEW: print our roster for this episode
+            print("  Our roster this episode:")
+            print_agent_roster(env, our_team)
+            print()
+
         # Save best models
         if len(all_scores) >= 100:
             recent_avg = np.mean(all_scores[-100:])
@@ -947,7 +977,7 @@ def main():
 
     print("\n[STEP 1/3] Training...")
     position_model, player_models, env, scores, ranks = train(
-        total_episodes=5000,
+        total_episodes=50,
         learning_rate=1e-3
     )
 
