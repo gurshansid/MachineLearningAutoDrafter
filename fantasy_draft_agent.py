@@ -7,8 +7,12 @@ Fixes:
 3. Correct column names from your data
 4. Added restart logic
 5. Bot slippage for easier learning
-
-Run this single file - no separate imports needed
+6. Bots + agent respect roster shape:
+   - EXACTLY 8 players per team
+   - Must end with at least: 1 QB, 2 RB, 2 WR, 1 TE
+   - Remaining 2 spots are FLEX from RB/WR/TE
+   - Bots still pick by ADP with slippage
+   - No extra "strategy" for bots beyond ADP + constraints
 """
 
 import pandas as pd
@@ -86,7 +90,6 @@ class PlayerValueNetwork(nn.Module):
 def get_qb_features(player_row, feature_means, feature_stds):
     """Extract and normalize QB-specific features"""
 
-    # Use columns that ACTUALLY exist in your data
     feature_cols = [
         'fantasy_adp',
         'avg_points_per_game',
@@ -212,7 +215,15 @@ class DraftEnvironment:
         self.n_rounds = n_rounds
         self.rng = random.Random(seed)
 
+        # Hard roster caps (still allow bench but we enforce exact shape via feasibility)
         self.roster_limits = {"QB": 2, "RB": 5, "WR": 5, "TE": 3}
+
+        # Desired minimums for final roster (hard constraints):
+        # 1 QB, 2 RB, 2 WR, 1 TE; total players = 8, so 2 more are FLEX from RB/WR/TE
+        self.min_requirements = {"QB": 1, "RB": 2, "WR": 2, "TE": 1}
+        self.max_players_per_team = 8
+
+        # For context features / "needs"
         self.starting_requirements = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
 
         # Load condensed (has features for evaluation)
@@ -272,17 +283,71 @@ class DraftEnvironment:
         taken = {p["player_index"] for p in self.draft_history}
         return self.player_pool[~self.player_pool.index.isin(taken)]
 
-    def can_draft_position(self, team_id: int, position: str):
-        return position in self.roster_limits and self.roster_counts[team_id][position] < self.roster_limits[position]
+    # ---- Roster needs & legality (used for BOTH agent and bots) -------------
 
     def get_roster_needs(self, team_id: int):
+        """
+        Needs based on desired lineup:
+        - 1 QB, 2 RB, 2 WR, 1 TE, 2 FLEX
+        Used mainly for context features and printing; hard legality is enforced
+        separately via feasibility check.
+        """
         needs = {}
         for pos in ["QB", "RB", "WR", "TE"]:
             needs[pos] = max(0, self.starting_requirements[pos] - self.roster_counts[team_id][pos])
-        total_needed = 8
+
+        total_needed = self.max_players_per_team
         filled = sum(self.roster_counts[team_id].values())
         needs["FLEX"] = max(0, total_needed - filled)
         return needs
+
+    def position_is_legal_for_roster(self, team_id: int, position: str) -> bool:
+        """
+        HARD legality check:
+
+        - Total players per team is capped at 8.
+        - Final roster MUST be able to end up with at least:
+          1 QB, 2 RB, 2 WR, 1 TE.
+        - This function checks:
+          "If we draft one more player at `position` right now,
+           is it STILL POSSIBLE to satisfy all minimum requirements
+           with the remaining picks?"
+        """
+        counts = self.roster_counts[team_id]
+        total = sum(counts.values())
+
+        # Already full
+        if total >= self.max_players_per_team:
+            return False
+
+        # Simulate adding one player at this position
+        new_counts = counts.copy()
+        new_counts[position] += 1
+        new_total = total + 1
+        remaining_picks = self.max_players_per_team - new_total
+
+        # Respect hard caps as well
+        if new_counts[position] > self.roster_limits[position]:
+            return False
+
+        # Compute how many "mandatory" picks we still need after this choice
+        needed = 0
+        for pos, req in self.min_requirements.items():
+            if new_counts[pos] < req:
+                needed += (req - new_counts[pos])
+
+        # If we don't have enough picks left to satisfy minimums, it's illegal
+        if needed > remaining_picks:
+            return False
+
+        # Otherwise, this position is legal
+        return True
+
+    def can_draft_position(self, team_id: int, position: str):
+        """
+        Compatibility helper, just defers to hard legality.
+        """
+        return self.position_is_legal_for_roster(team_id, position)
 
     def get_context_vector(self, team_id: int, round_num: int):
         needs = self.get_roster_needs(team_id)
@@ -293,15 +358,21 @@ class DraftEnvironment:
         pick_in_round = order.index(team_id) + 1
 
         return np.array([
-            round_num / self.n_rounds, pick_in_round / self.n_teams,
-            needs.get("QB", 0), needs.get("RB", 0), needs.get("WR", 0),
-            needs.get("TE", 0), needs.get("FLEX", 0),
-            roster_size / self.n_rounds, picks_remaining / self.n_rounds, draft_position
+            round_num / self.n_rounds,
+            pick_in_round / self.n_teams,
+            needs.get("QB", 0),
+            needs.get("RB", 0),
+            needs.get("WR", 0),
+            needs.get("TE", 0),
+            needs.get("FLEX", 0),
+            roster_size / self.n_rounds,
+            picks_remaining / self.n_rounds,
+            draft_position
         ], dtype=np.float32)
 
     def get_available_at_position(self, team_id: int, position: str):
-        """Get available players at position"""
-        if not self.can_draft_position(team_id, position):
+        """Get available players at position, respecting HARD roster shape."""
+        if not self.position_is_legal_for_roster(team_id, position):
             return []
 
         available = self.get_available_players()
@@ -313,9 +384,12 @@ class DraftEnvironment:
 
     def make_pick(self, team_id: int, player_row: pd.Series):
         info = {
-            "round": self.current_round, "team_id": team_id,
-            "player_index": player_row.name, "position": player_row["position"],
-            "first_name": player_row["first_name"], "last_name": player_row["last_name"],
+            "round": self.current_round,
+            "team_id": team_id,
+            "player_index": player_row.name,
+            "position": player_row["position"],
+            "first_name": player_row["first_name"],
+            "last_name": player_row["last_name"],
             "fantasy_points_ppr": player_row["fantasy_points_ppr"],
             "adp": player_row["fantasy_adp"]
         }
@@ -325,34 +399,38 @@ class DraftEnvironment:
             self.roster_counts[team_id][player_row["position"]] += 1
 
     def bot_pick(self, team_id: int, slippage=15):
-        """Bot that heavily prefers top ADP players.
-
-        Default behavior:
-        - Best ADP: 85%
-        - Second best: 10%
-        - Third best: 4%
-        - All remaining (within slippage window): split 1%
         """
+        Bot that:
+        - Picks the top-ADP players (with slippage window),
+        - BUT only from positions that keep it possible to end with:
+          1 QB, 2 RB, 2 WR, 1 TE in a total of 8 players.
+        - No extra strategy beyond that.
+        """
+        # Already has a full roster under our hard constraints
+        if len(self.rosters[team_id]) >= self.max_players_per_team:
+            return None
+
         available = self.get_available_players()
         if available.empty:
             return None
 
-        # Only consider players that fit roster limits
-        legal = [
-            row for _, row in available.iterrows()
-            if self.can_draft_position(team_id, row["position"])
-        ]
+        # Only consider players that are legal given hard feasibility
+        legal_rows = []
+        for _, row in available.iterrows():
+            pos = row["position"]
+            if self.position_is_legal_for_roster(team_id, pos):
+                legal_rows.append(row)
 
-        if not legal:
+        if not legal_rows:
             return None
 
-        legal_df = pd.DataFrame(legal).sort_values("fantasy_adp")
+        legal_df = pd.DataFrame(legal_rows).sort_values("fantasy_adp")
 
         # Limit to top N by ADP (slippage window)
         top_n = min(slippage, len(legal_df))
         top_players = legal_df.iloc[:top_n]
 
-        # Build weights
+        # Build weights (slippage pattern)
         weights = np.zeros(top_n, dtype=np.float64)
 
         if top_n >= 1:
@@ -363,27 +441,32 @@ class DraftEnvironment:
             weights[2] = 0.04  # third best
 
         if top_n > 3:
-            # Remaining 1% split among indices 3..top_n-1
             remaining_prob = 1.0 - weights.sum()
             if remaining_prob < 0:
-                # numerical safety (shouldn't really happen with 0.85+0.10+0.04)
                 remaining_prob = 0.0
             tail_count = top_n - 3
             if tail_count > 0 and remaining_prob > 0:
                 weights[3:] = remaining_prob / tail_count
 
-        # If something weird happens (e.g., top_n < 3) and sum != 1, renormalize
         if weights.sum() == 0:
-            # fallback to uniform if somehow everything is 0
             weights[:] = 1.0 / top_n
         else:
             weights /= weights.sum()
 
-        # Sample according to these probabilities
         chosen_idx = np.random.choice(top_n, p=weights)
         return top_players.iloc[chosen_idx]
 
     def build_starting_lineup(self, team_id: int):
+        """
+        Build the final lineup with:
+        - 1 QB
+        - 2 RB
+        - 2 WR
+        - 1 TE
+        - 2 FLEX (from remaining RB/WR/TE)
+        Given the hard legality constraints, every team SHOULD be able to
+        satisfy this shape exactly.
+        """
         players = self.rosters[team_id]
         lineup = {"QB": [], "RB": [], "WR": [], "TE": [], "FLEX": [], "BENCH": []}
 
@@ -397,21 +480,25 @@ class DraftEnvironment:
 
         used = set()
 
+        # 1 QB
         if by_pos["QB"]:
             lineup["QB"].append(by_pos["QB"][0])
             used.add(by_pos["QB"][0].name)
 
+        # 2 RB, 2 WR, 1 TE
         for pos, n in [("RB", 2), ("WR", 2), ("TE", 1)]:
             for p in by_pos[pos][:n]:
                 lineup[pos].append(p)
                 used.add(p.name)
 
+        # 2 FLEX from remaining RB/WR/TE
         flex_cands = [p for pos in ["RB", "WR", "TE"] for p in by_pos[pos] if p.name not in used]
         flex_cands.sort(key=lambda x: x["fantasy_points_ppr"], reverse=True)
         for p in flex_cands[:2]:
             lineup["FLEX"].append(p)
             used.add(p.name)
 
+        # Bench = everything else
         for p in players:
             if p.name not in used:
                 lineup["BENCH"].append(p)
@@ -474,7 +561,11 @@ class HierarchicalAgent:
         print("[Agent] Hierarchical agent initialized")
 
     def pick_player(self, env, team_id, round_num, epsilon, training=True):
-        """Two-stage pick: position then player"""
+        """Two-stage pick: position then player, under HARD roster constraints"""
+
+        # If we're already full, no pick
+        if len(env.rosters[team_id]) >= env.max_players_per_team:
+            return None, None
 
         context = env.get_context_vector(team_id, round_num)
         context_tensor = torch.tensor(context, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -484,6 +575,7 @@ class HierarchicalAgent:
         legal_indices = []
 
         for pos in self.positions:
+            # Uses the same hard legality and availability as bots
             if env.get_available_at_position(team_id, pos):
                 legal_positions.append(pos)
                 legal_indices.append(self.pos_to_idx[pos])
@@ -520,9 +612,8 @@ class HierarchicalAgent:
         if not available_players:
             return None, None
 
-        # FIXED: Extract features properly using feature extraction functions
+        # Extract features properly using feature extraction functions
         player_features = []
-
         for player_row in available_players:
             if chosen_position == "QB":
                 feats = get_qb_features(player_row, env.feature_means, env.feature_stds)
@@ -532,7 +623,6 @@ class HierarchicalAgent:
                 feats = get_wr_features(player_row, env.feature_means, env.feature_stds)
             else:  # TE
                 feats = get_te_features(player_row, env.feature_means, env.feature_stds)
-
             player_features.append(feats)
 
         player_tensor = torch.tensor(np.stack(player_features), dtype=torch.float32, device=self.device)
@@ -571,17 +661,9 @@ class HierarchicalAgent:
 def should_restart(scores, rank_threshold=8.0):
     """
     Restart if average rank > threshold over last 200 episodes
-
-    Args:
-        scores: All episode scores
-        rank_threshold: Restart if avg rank worse than this (8 = bottom third)
     """
-
     if len(scores) < 400:
         return False, None
-
-    # We need to track ranks, not scores - but for now use score as proxy
-    # TODO: Track actual ranks during training
 
     recent_200 = scores[-200:]
     previous_200 = scores[-400:-200]
@@ -590,7 +672,6 @@ def should_restart(scores, rank_threshold=8.0):
     prev_avg = np.mean(previous_200)
     improvement = recent_avg - prev_avg
 
-    # Restart if not improving
     if improvement < 5.0:
         return True, f"Stalled: {recent_avg:.1f} (only {improvement:+.1f} improvement)"
 
@@ -610,6 +691,8 @@ def train(total_episodes=5000, learning_rate=1e-3):
     print(f"\nImprovements:")
     print(f"  ✓ Fixed feature extraction")
     print(f"  ✓ Bot slippage (top 15)")
+    print(f"  ✓ HARD roster constraints (exactly 8 players, min 1 QB / 2 RB / 2 WR / 1 TE)")
+    print(f"  ✓ Agent uses same roster constraints as bots")
     print(f"  ✓ Fast epsilon decay")
     print(f"  ✓ NO RESTARTS - let it learn!")
     print("=" * 80)
@@ -743,7 +826,6 @@ def train(total_episodes=5000, learning_rate=1e-3):
                 f"ε:{epsilon:.3f}"
             )
 
-            # NEW: print our roster for this episode
             print("  Our roster this episode:")
             print_agent_roster(env, our_team)
             print()
@@ -810,7 +892,7 @@ def plot_results(scores, ranks):
     if len(ranks) >= 100:
         ma = pd.Series(ranks).rolling(100).mean()
         ax.plot(ma, linewidth=2.5, label='100-Ep MA')
-    ax.axhline(y=6.5, linestyle='--', label='Random')
+        ax.axhline(y=6.5, linestyle='--', label='Random')
     ax.set_xlabel("Episode")
     ax.set_ylabel("Rank (1=Best)")
     ax.set_title("Training Ranks")
@@ -830,13 +912,15 @@ def plot_results(scores, ranks):
 
 def inspect_learned_policy(position_model, player_models, env):
     """
-    Print a human-readable summary of the learned position policy and
-    player preferences, similar to the fantasy_draft_agent diagnostics.
+    Print a human-readable summary of the learned player preferences
+    and a single showcase draft with the trained policy.
     """
     device = next(position_model.parameters()).device
     position_model.eval()
     for m in player_models.values():
         m.eval()
+
+    positions = ["QB", "RB", "WR", "TE"]
 
     print()
     print("=" * 80)
@@ -851,39 +935,16 @@ def inspect_learned_policy(position_model, player_models, env):
     print()
 
     # ----------------------------------------------------------------------
-    # LEARNED POSITION POLICY - by round for a mid-slot team (static context)
+    # LEARNED PLAYER PREFERENCES - top 10 per position (neutral-ish context)
     # ----------------------------------------------------------------------
-    mid_team = env.n_teams // 2  # e.g., 6 for 12-team league
+    mid_team = env.n_teams // 2
     env.reset(our_team_id=mid_team)
 
-    positions = ["QB", "RB", "WR", "TE"]
-
-    print("=" * 80)
-    print("LEARNED POSITION POLICY (probabilities by round, mid-slot team)")
-    print("=" * 80)
-
-    with torch.no_grad():
-        for rnd in range(1, env.n_rounds + 1):
-            context = env.get_context_vector(mid_team, rnd)
-            ctx = torch.tensor(context, dtype=torch.float32, device=device).unsqueeze(0)
-            logits = position_model(ctx).squeeze(0)
-            probs = torch.softmax(logits, dim=0).cpu().numpy()
-
-            qb_p, rb_p, wr_p, te_p = probs
-            print(
-                f"Round {rnd}: QB={qb_p:0.2f}, RB={rb_p:0.2f}, "
-                f"WR={wr_p:0.2f}, TE={te_p:0.2f}"
-            )
-
-    print()
     print("=" * 80)
     print("LEARNED PLAYER PREFERENCES (top players per position)")
     print("=" * 80)
     print()
 
-    # ----------------------------------------------------------------------
-    # LEARNED PLAYER PREFERENCES - top 10 per position
-    # ----------------------------------------------------------------------
     def eval_player_value(row, pos: str):
         if pos == "QB":
             feats = get_qb_features(row, env.feature_means, env.feature_stds)
@@ -895,7 +956,6 @@ def inspect_learned_policy(position_model, player_models, env):
             feats = get_te_features(row, env.feature_means, env.feature_stds)
 
         feats_t = torch.tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-        # Use a neutral-ish context: mid team, middle round (e.g., round 4)
         context = env.get_context_vector(mid_team, round_num=min(4, env.n_rounds))
         ctx_t = torch.tensor(context, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -913,7 +973,6 @@ def inspect_learned_policy(position_model, player_models, env):
             val = eval_player_value(row, pos)
             player_vals.append((row, val))
 
-        # Sort descending by learned value
         player_vals.sort(key=lambda x: x[1], reverse=True)
 
         print(f"Top 10 {pos}s according to the learned player policy:")
@@ -926,39 +985,70 @@ def inspect_learned_policy(position_model, player_models, env):
         print()
 
     # ----------------------------------------------------------------------
-    # POSITION POLICY MATRIX: round × pick × position (static, empty rosters)
+    # REALISTIC DRAFT TRACE
     # ----------------------------------------------------------------------
-    print("[STEP] Computing position policy matrix (round × pick × position)...")
-    print()
     print("=" * 80)
-    print("LEARNED POSITION POLICY BY ROUND AND PICK (STATIC, EMPTY ROSTERS)")
-    print("Rows = rounds, Columns = picks in that round (snake-order index)")
-    print("Each line shows: QB/RB/WR/TE probabilities.")
+    print("REALISTIC POSITION POLICY DURING A SHOWCASE DRAFT (MID-SLOT TEAM)")
     print("=" * 80)
+    print("Showing masked position probabilities for our picks (ε=0),")
+    print("with bots drafting purely by ADP + slippage under HARD roster constraints.")
     print()
 
-    # Reset to empty rosters for a clean static view
-    env.reset()
+    showcase_team = env.n_teams // 2
+    env.reset(our_team_id=showcase_team)
+    agent = HierarchicalAgent(position_model, player_models, env)
 
     with torch.no_grad():
         for rnd in range(1, env.n_rounds + 1):
+            env.current_round = rnd
             order = env.get_draft_order(rnd)
             print(f"Round {rnd}:")
             for pick_idx, team_id in enumerate(order, start=1):
-                context = env.get_context_vector(team_id, rnd)
-                ctx = torch.tensor(context, dtype=torch.float32, device=device).unsqueeze(0)
-                logits = position_model(ctx).squeeze(0)
-                probs = torch.softmax(logits, dim=0).cpu().numpy()
-                qb_p, rb_p, wr_p, te_p = probs
+                if team_id == showcase_team:
+                    context = env.get_context_vector(team_id, rnd)
+                    ctx = torch.tensor(context, dtype=torch.float32, device=device).unsqueeze(0)
+                    logits = position_model(ctx).squeeze(0)
 
-                print(
-                    f"  Pick {pick_idx:2d}: QB={qb_p:0.2f}, RB={rb_p:0.2f}, "
-                    f"WR={wr_p:0.2f}, TE={te_p:0.2f}"
-                )
+                    legal_mask = torch.full((4,), float("-inf"), device=device)
+                    for i, pos in enumerate(positions):
+                        if env.get_available_at_position(team_id, pos):
+                            legal_mask[i] = 0.0
+
+                    masked_logits = logits + legal_mask
+                    probs = torch.softmax(masked_logits, dim=0).cpu().numpy()
+                    qb_p, rb_p, wr_p, te_p = probs
+
+                    needs = env.get_roster_needs(team_id)
+                    print(
+                        f"  Pick {pick_idx:2d} (our team): "
+                        f"QB={qb_p:0.2f}, RB={rb_p:0.2f}, WR={wr_p:0.2f}, TE={te_p:0.2f} | "
+                        f"needs: QB={needs['QB']}, RB={needs['RB']}, "
+                        f"WR={needs['WR']}, TE={needs['TE']}, FLEX={needs['FLEX']}"
+                    )
+
+                    player, _ = agent.pick_player(env, team_id, rnd, epsilon=0.0, training=False)
+                    if player is not None:
+                        env.make_pick(team_id, player)
+                        name = f"{player['first_name']} {player['last_name']}"
+                        print(
+                            f"    -> Drafted {name} ({player['position']}) "
+                            f"ADP={float(player['fantasy_adp']):.1f} "
+                            f"PPR={float(player['fantasy_points_ppr']):.1f}"
+                        )
+                    else:
+                        print("    -> No legal pick available for our team!")
+                else:
+                    bot_player = env.bot_pick(team_id)
+                    if bot_player is not None:
+                        env.make_pick(team_id, bot_player)
+
             print()
 
+    print("Final roster for our showcase team:")
+    print_agent_roster(env, showcase_team)
+    print()
     print("=" * 80)
-    print("✓ HIERARCHICAL RL TRAINING COMPLETE!")
+    print("✓ HIERARCHICAL RL INSPECTION COMPLETE")
     print("=" * 80)
 
 
@@ -977,7 +1067,7 @@ def main():
 
     print("\n[STEP 1/3] Training...")
     position_model, player_models, env, scores, ranks = train(
-        total_episodes=50,
+        total_episodes=1500,
         learning_rate=1e-3
     )
 
@@ -989,7 +1079,7 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    torch.manual_seed(15)
+    np.random.seed(15)
+    random.seed(15)
     main()
