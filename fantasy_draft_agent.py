@@ -1,31 +1,13 @@
-"""
-FIXED HIERARCHICAL RL - All 5 Networks in One File
-WITH MULTI-RUN CAPABILITY (50 runs x 20,000 episodes)
-
-Fixes:
-1. Feature extraction (was returning all zeros!)
-2. Proper normalization handling
-3. Correct column names from your data
-4. Added restart logic
-5. Bot slippage for easier learning
-6. Bots + agent respect roster shape:
-   - EXACTLY 8 players per team
-   - Must end with at least: 1 QB, 2 RB, 2 WR, 1 TE
-   - Remaining 2 spots are FLEX from RB/WR/TE
-   - QBs are hard-capped at 1 → no second QB / no bench
-   - Bots still pick by ADP with slippage
-   - No extra "strategy" for bots beyond ADP + constraints
-"""
-
-import pandas as pd
-import numpy as np
+import copy
 import random
 from typing import Optional, Dict
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
-import copy
 
 
 # ============================================================================
@@ -34,9 +16,9 @@ import copy
 
 class PositionPolicyNetwork(nn.Module):
     """Decides which position to draft given context"""
+
     def __init__(self, context_size: int = 10):
         super().__init__()
-
         self.network = nn.Sequential(
             nn.Linear(context_size, 64),
             nn.ReLU(),
@@ -55,6 +37,7 @@ class PositionPolicyNetwork(nn.Module):
 
 class PlayerValueNetwork(nn.Module):
     """Generic player value network (used for all positions)"""
+
     def __init__(self, player_feature_size: int, context_size: int = 10):
         super().__init__()
 
@@ -86,8 +69,17 @@ class PlayerValueNetwork(nn.Module):
 
 
 # ============================================================================
-# FEATURE EXTRACTION - FIXED VERSION
+# FEATURE EXTRACTION HELPERS
 # ============================================================================
+
+def _normalize_feature(val: float, col: str, feature_means: pd.Series, feature_stds: pd.Series) -> float:
+    if col in feature_means.index:
+        mean = feature_means[col]
+        std = feature_stds[col]
+        return (val - mean) / std if std > 0 else 0.0
+    # Fallback if something is missing from means/stds
+    return val / 100.0
+
 
 def get_qb_features(player_row, feature_means, feature_stds):
     """Extract and normalize QB-specific features"""
@@ -101,22 +93,15 @@ def get_qb_features(player_row, feature_means, feature_stds):
         "avg_rushing_tds",
     ]
 
-    features = []
+    feats = []
     for col in feature_cols:
         if col in player_row.index:
             val = float(player_row[col])
-            # Normalize using precomputed stats
-            if col in feature_means.index:
-                mean = feature_means[col]
-                std = feature_stds[col]
-                normalized = (val - mean) / std if std > 0 else 0.0
-            else:
-                normalized = val / 100.0  # Fallback normalization
-            features.append(normalized)
+            feats.append(_normalize_feature(val, col, feature_means, feature_stds))
         else:
-            features.append(0.0)
+            feats.append(0.0)
 
-    return np.array(features, dtype=np.float32)
+    return np.array(feats, dtype=np.float32)
 
 
 def get_rb_features(player_row, feature_means, feature_stds):
@@ -132,21 +117,15 @@ def get_rb_features(player_row, feature_means, feature_stds):
         "avg_receiving_tds",
     ]
 
-    features = []
+    feats = []
     for col in feature_cols:
         if col in player_row.index:
             val = float(player_row[col])
-            if col in feature_means.index:
-                mean = feature_means[col]
-                std = feature_stds[col]
-                normalized = (val - mean) / std if std > 0 else 0.0
-            else:
-                normalized = val / 100.0
-            features.append(normalized)
+            feats.append(_normalize_feature(val, col, feature_means, feature_stds))
         else:
-            features.append(0.0)
+            feats.append(0.0)
 
-    return np.array(features, dtype=np.float32)
+    return np.array(feats, dtype=np.float32)
 
 
 def get_wr_features(player_row, feature_means, feature_stds):
@@ -161,21 +140,15 @@ def get_wr_features(player_row, feature_means, feature_stds):
         "avg_receiving_tds",
     ]
 
-    features = []
+    feats = []
     for col in feature_cols:
         if col in player_row.index:
             val = float(player_row[col])
-            if col in feature_means.index:
-                mean = feature_means[col]
-                std = feature_stds[col]
-                normalized = (val - mean) / std if std > 0 else 0.0
-            else:
-                normalized = val / 100.0
-            features.append(normalized)
+            feats.append(_normalize_feature(val, col, feature_means, feature_stds))
         else:
-            features.append(0.0)
+            feats.append(0.0)
 
-    return np.array(features, dtype=np.float32)
+    return np.array(feats, dtype=np.float32)
 
 
 def get_te_features(player_row, feature_means, feature_stds):
@@ -190,21 +163,15 @@ def get_te_features(player_row, feature_means, feature_stds):
         "avg_receiving_tds",
     ]
 
-    features = []
+    feats = []
     for col in feature_cols:
         if col in player_row.index:
             val = float(player_row[col])
-            if col in feature_means.index:
-                mean = feature_means[col]
-                std = feature_stds[col]
-                normalized = (val - mean) / std if std > 0 else 0.0
-            else:
-                normalized = val / 100.0
-            features.append(normalized)
+            feats.append(_normalize_feature(val, col, feature_means, feature_stds))
         else:
-            features.append(0.0)
+            feats.append(0.0)
 
-    return np.array(features, dtype=np.float32)
+    return np.array(feats, dtype=np.float32)
 
 
 # ============================================================================
@@ -212,6 +179,14 @@ def get_te_features(player_row, feature_means, feature_stds):
 # ============================================================================
 
 class DraftEnvironment:
+    """
+    Draft environment that:
+      - Uses a single condensed feature file (built from 2023)
+      - Uses a per-season stats file to define the reward:
+          * nfl_players_2023_stats.csv for training
+          * nfl_players_2024_stats.csv for evaluation
+    """
+
     def __init__(
         self,
         condensed_path: str,
@@ -235,12 +210,14 @@ class DraftEnvironment:
         self.max_players_per_team = 8
 
         # For context features / "needs"
-        self.starting_requirements = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2}
+        self.starting_requirements = {"QB": 1, "RB": 2, "WR": 2, "FLEX": 2, "TE": 1}
 
-        # Load condensed (has features for evaluation)
+        # ------------------------------------------------------------------
+        # 1) Load condensed feature file (built from previous season)
+        # ------------------------------------------------------------------
         df_condensed = pd.read_csv(condensed_path)
 
-        # Convert position one-hot to single column
+        # Convert position one-hot to single column if needed
         if "pos_qb" in df_condensed.columns:
             df_condensed["position"] = "UNKNOWN"
             df_condensed.loc[df_condensed["pos_qb"] == 1, "position"] = "QB"
@@ -248,37 +225,48 @@ class DraftEnvironment:
             df_condensed.loc[df_condensed["pos_wr"] == 1, "position"] = "WR"
             df_condensed.loc[df_condensed["pos_te"] == 1, "position"] = "TE"
 
-        # Load 2024 stats (has actual fantasy points for scoring)
-        df_2024 = pd.read_csv(stats_path)
+        # ------------------------------------------------------------------
+        # 2) Load season stats for the reward (train: 2023, eval: 2024)
+        # ------------------------------------------------------------------
+        df_stats = pd.read_csv(stats_path)
 
-        # Merge to get actual 2024 fantasy points
+        if "fantasy_points_ppr" not in df_stats.columns:
+            raise ValueError(f"{stats_path} must contain fantasy_points_ppr")
+
+        # ------------------------------------------------------------------
+        # 3) Merge: features (from previous year) + reward (this year)
+        # ------------------------------------------------------------------
         df = df_condensed.merge(
-            df_2024[["first_name", "last_name", "fantasy_points_ppr"]],
+            df_stats[["first_name", "last_name", "fantasy_points_ppr"]],
             on=["first_name", "last_name"],
-            how="inner",  # Only keep players in both files
-            suffixes=("_pred", "_actual"),
+            how="inner",  # only keep players present in both
         )
 
-        # Use actual 2024 points for scoring
-        if "fantasy_points_ppr_actual" in df.columns:
-            df["fantasy_points_ppr"] = df["fantasy_points_ppr_actual"]
-
-        # Filter to draftable
+        # Filter to draftable positions and roughly draftable ADP
         df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
-        df = df[df["fantasy_adp"] < 300].copy()
-        df = df.sort_values("fantasy_adp").reset_index(drop=True)
+        if "fantasy_adp" in df.columns:
+            df = df[df["fantasy_adp"] < 300].copy()
 
+        df = df.sort_values("fantasy_adp").reset_index(drop=True)
         self.player_pool = df
 
-        # Compute feature statistics for normalization
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        # ------------------------------------------------------------------
+        # 4) Compute feature statistics for normalization
+        #    IMPORTANT: don't let reward column influence normalization.
+        # ------------------------------------------------------------------
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [c for c in numeric_cols if not c.startswith("fantasy_points_ppr")]
+
         self.feature_means = df[numeric_cols].mean()
         self.feature_stds = df[numeric_cols].std().replace(0, 1.0)
 
         self.reset()
-        print(f"[Environment] Loaded {len(df)} players")
+        print(f"[Environment] Loaded {len(df)} players from {stats_path}")
         print(f"[Environment] Positions: {df['position'].value_counts().to_dict()}")
 
+    # ----------------------------------------------------------------------
+    # Basic draft mechanics
+    # ----------------------------------------------------------------------
     def reset(self, our_team_id: Optional[int] = None):
         self.our_team_id = (
             our_team_id
@@ -305,8 +293,9 @@ class DraftEnvironment:
         taken = {p["player_index"] for p in self.draft_history}
         return self.player_pool[~self.player_pool.index.isin(taken)]
 
-    # ---- Roster needs & legality (used for BOTH agent and bots) -------------
-
+    # ----------------------------------------------------------------------
+    # Roster needs & legality (used for BOTH agent and bots)
+    # ----------------------------------------------------------------------
     def get_roster_needs(self, team_id: int):
         """
         Needs based on desired lineup:
@@ -333,10 +322,6 @@ class DraftEnvironment:
         - Final roster MUST be able to end up with at least:
           1 QB, 2 RB, 2 WR, 1 TE.
         - QBs are hard-capped at 1.
-        - This function checks:
-          "If we draft one more player at `position` right now,
-           is it STILL POSSIBLE to satisfy all minimum requirements
-           with the remaining picks?"
         """
         counts = self.roster_counts[team_id]
         total = sum(counts.values())
@@ -369,9 +354,7 @@ class DraftEnvironment:
         return True
 
     def can_draft_position(self, team_id: int, position: str):
-        """
-        Compatibility helper, just defers to hard legality.
-        """
+        """Compatibility helper, just defers to hard legality."""
         return self.position_is_legal_for_roster(team_id, position)
 
     def get_context_vector(self, team_id: int, round_num: int):
@@ -435,7 +418,6 @@ class DraftEnvironment:
         - BUT only from positions that keep it possible to end with:
           1 QB, 2 RB, 2 WR, 1 TE in a total of 8 players.
         - QBs are capped at 1, so bots never take a second QB.
-        - No extra strategy beyond that.
         """
         # Already has a full roster under our hard constraints
         if len(self.rosters[team_id]) >= self.max_players_per_team:
@@ -473,8 +455,7 @@ class DraftEnvironment:
 
         if top_n > 3:
             remaining_prob = 1.0 - weights.sum()
-            if remaining_prob < 0:
-                remaining_prob = 0.0
+            remaining_prob = max(remaining_prob, 0.0)
             tail_count = top_n - 3
             if tail_count > 0 and remaining_prob > 0:
                 weights[3:] = remaining_prob / tail_count
@@ -515,7 +496,7 @@ class DraftEnvironment:
 
         used = set()
 
-        # 1 QB (there should be exactly 1)
+        # 1 QB
         if by_pos["QB"]:
             lineup["QB"].append(by_pos["QB"][0])
             used.add(by_pos["QB"][0].name)
@@ -573,7 +554,6 @@ def print_agent_roster(env: DraftEnvironment, team_id: int):
             adp = float(p["fantasy_adp"])
             print(f"    {pos:<5} {name:<25} PPR={pts:6.1f}  ADP={adp:6.1f}")
 
-    # Bench should always be empty now, but we keep this for safety / debugging
     if lineup["BENCH"]:
         print("  Bench:")
         for p in lineup["BENCH"]:
@@ -592,7 +572,8 @@ def print_league_roster_counts(env: DraftEnvironment):
         counts = env.roster_counts[tid]
         total = sum(counts.values())
         print(
-            f"     {tid:2d} |  {counts['QB']:2d} {counts['RB']:3d} {counts['WR']:3d} {counts['TE']:3d} | {total:4d}"
+            f"     {tid:2d} |  {counts['QB']:2d} {counts['RB']:3d} "
+            f"{counts['WR']:3d} {counts['TE']:3d} | {total:4d}"
         )
     print()
 
@@ -639,7 +620,6 @@ class HierarchicalAgent:
         legal_indices = []
 
         for pos in self.positions:
-            # Uses the same hard legality and availability as bots
             if env.get_available_at_position(team_id, pos):
                 legal_positions.append(pos)
                 legal_indices.append(self.pos_to_idx[pos])
@@ -676,7 +656,6 @@ class HierarchicalAgent:
 
         # STAGE 2: Choose player at that position
         available_players = env.get_available_at_position(team_id, chosen_position)
-
         if not available_players:
             return None, None
 
@@ -739,49 +718,23 @@ class HierarchicalAgent:
 
 
 # ============================================================================
-# RESTART DETECTION (currently unused, but kept for future use)
+# TRAINING ON 2023, THEN EVAL ON 2024
 # ============================================================================
 
-def should_restart(scores, rank_threshold: float = 8.0):
-    """
-    Restart if average rank > threshold over last 200 episodes
-    """
-    if len(scores) < 400:
-        return False, None
-
-    recent_200 = scores[-200:]
-    previous_200 = scores[-400:-200]
-
-    recent_avg = np.mean(recent_200)
-    prev_avg = np.mean(previous_200)
-    improvement = recent_avg - prev_avg
-
-    if improvement < 5.0:
-        return True, f"Stalled: {recent_avg:.1f} (only {improvement:+.1f} improvement)"
-
-    return False, None
-
-
-# ============================================================================
-# TRAINING
-# ============================================================================
-
-def train(total_episodes: int = 20000, learning_rate: float = 1e-3):
-    """Train hierarchical agent WITHOUT restarts - let it learn!"""
+def train_on_2023(
+    total_episodes: int = 1500,
+    learning_rate: float = 1e-3,
+    condensed_path: str = "nfl_players_condensed.csv",
+    stats_2023_path: str = "nfl_players_2023_stats.csv",
+):
+    """Train hierarchical agent on 2023 outcomes only."""
 
     print("=" * 80)
-    print("HIERARCHICAL RL (NO RESTARTS)")
+    print("HIERARCHICAL RL – TRAIN ON 2023, EVAL ON 2024")
     print("=" * 80)
-    print("\nImprovements:")
-    print("  ✓ Fixed feature extraction")
-    print("  ✓ Bot slippage (top 15)")
-    print(
-        "  ✓ HARD roster constraints (exactly 8 players, min 1 QB / 2 RB / 2 WR / 1 TE, QB cap=1)"
-    )
-    print("  ✓ Agent uses same roster constraints as bots")
-    print(f"  ✓ Adaptive epsilon decay for {total_episodes} episodes")
-    print("  ✓ NO RESTARTS - let it learn!")
-    print("=" * 80)
+    print("  • Features from nfl_players_condensed.csv (built from 2023)")
+    print("  • Reward during training = 2023 fantasy_points_ppr")
+    print("  • We will later freeze the policy and test on 2024.\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -791,28 +744,30 @@ def train(total_episodes: int = 20000, learning_rate: float = 1e-3):
     best_avg_score = -float("inf")
     best_models = None
 
-    # Create environment ONCE
-    env = DraftEnvironment(
-        condensed_path="nfl_players_condensed.csv",
-        stats_path="nfl_players_2024_stats.csv",
+    # ----------------------------- 
+    # Environment for TRAINING (2023)
+    # -----------------------------
+    env_train = DraftEnvironment(
+        condensed_path=condensed_path,
+        stats_path=stats_2023_path,
         n_teams=12,
         n_rounds=8,
         seed=42,
     )
 
-    # Create networks ONCE
+    # Create networks ONCE (shared for train + eval)
     position_model = PositionPolicyNetwork(context_size=10).to(device)
 
-    # Get feature sizes
-    sample_qb = env.player_pool[env.player_pool["position"] == "QB"].iloc[0]
-    sample_rb = env.player_pool[env.player_pool["position"] == "RB"].iloc[0]
-    sample_wr = env.player_pool[env.player_pool["position"] == "WR"].iloc[0]
-    sample_te = env.player_pool[env.player_pool["position"] == "TE"].iloc[0]
+    # Feature sizes from training env
+    sample_qb = env_train.player_pool[env_train.player_pool["position"] == "QB"].iloc[0]
+    sample_rb = env_train.player_pool[env_train.player_pool["position"] == "RB"].iloc[0]
+    sample_wr = env_train.player_pool[env_train.player_pool["position"] == "WR"].iloc[0]
+    sample_te = env_train.player_pool[env_train.player_pool["position"] == "TE"].iloc[0]
 
-    qb_size = len(get_qb_features(sample_qb, env.feature_means, env.feature_stds))
-    rb_size = len(get_rb_features(sample_rb, env.feature_means, env.feature_stds))
-    wr_size = len(get_wr_features(sample_wr, env.feature_means, env.feature_stds))
-    te_size = len(get_te_features(sample_te, env.feature_means, env.feature_stds))
+    qb_size = len(get_qb_features(sample_qb, env_train.feature_means, env_train.feature_stds))
+    rb_size = len(get_rb_features(sample_rb, env_train.feature_means, env_train.feature_stds))
+    wr_size = len(get_wr_features(sample_wr, env_train.feature_means, env_train.feature_stds))
+    te_size = len(get_te_features(sample_te, env_train.feature_means, env_train.feature_stds))
 
     print(f"Feature sizes: QB={qb_size}, RB={rb_size}, WR={wr_size}, TE={te_size}")
 
@@ -830,46 +785,43 @@ def train(total_episodes: int = 20000, learning_rate: float = 1e-3):
         for pos, model in player_models.items()
     }
 
-    agent = HierarchicalAgent(position_model, player_models, env)
+    agent = HierarchicalAgent(position_model, player_models, env_train)
 
-    print("\nTraining without restarts...\n")
+    print("\n[TRAIN] Starting training on 2023...\n")
 
     for episodes_done in range(total_episodes):
 
-        # Epsilon schedule for 20,000 episodes: 0.9 → 0.05
-        if episodes_done < 12000:
-            epsilon = max(0.10, 0.9 - 0.80 * (episodes_done / 12000))
-        else:
-            epsilon = max(0.05, 0.10 - 0.05 * ((episodes_done - 12000) / 8000))
+        # Epsilon schedule: start high exploration, then decay
+        epsilon = max(0.05, 0.5 - 0.45 * min(1.0, episodes_done / 1000))
 
-        our_team = env.reset()
+        our_team = env_train.reset()
         log_probs = []
 
         # -----------------------------
-        # Run draft
+        # Run one full draft episode
         # -----------------------------
-        for rnd in range(1, env.n_rounds + 1):
-            env.current_round = rnd
-            order = env.get_draft_order(rnd)
+        for rnd in range(1, env_train.n_rounds + 1):
+            env_train.current_round = rnd
+            order = env_train.get_draft_order(rnd)
 
             for tid in order:
                 if tid == our_team:
                     player, log_prob = agent.pick_player(
-                        env, tid, rnd, epsilon, training=True
+                        env_train, tid, rnd, epsilon, training=True
                     )
                     if player is not None:
-                        env.make_pick(tid, player)
+                        env_train.make_pick(tid, player)
                         if log_prob is not None:
                             log_probs.append(log_prob)
                 else:
-                    player = env.bot_pick(tid)
+                    player = env_train.bot_pick(tid)
                     if player is not None:
-                        env.make_pick(tid, player)
+                        env_train.make_pick(tid, player)
 
         # -----------------------------
-        # Evaluate
+        # Evaluate (2023 reward)
         # -----------------------------
-        scores_dict = env.evaluate_league()
+        scores_dict = env_train.evaluate_league()
         our_score = scores_dict[our_team]
         league_scores = list(scores_dict.values())
         our_rank = sorted(league_scores, reverse=True).index(our_score) + 1
@@ -905,21 +857,20 @@ def train(total_episodes: int = 20000, learning_rate: float = 1e-3):
         all_scores.append(our_score)
         all_ranks.append(our_rank)
 
-        if (episodes_done + 1) % 200 == 0:
-            window = min(500, len(all_scores))
+        if (episodes_done + 1) % 50 == 0:
+            window = min(100, len(all_scores))
             avg_score = np.mean(all_scores[-window:])
             avg_rank = np.mean(all_ranks[-window:])
-
             print(
-                f"Ep {episodes_done+1:5d}/{total_episodes} | "
+                f"[TRAIN] Ep {episodes_done+1:4d}/{total_episodes} | "
                 f"Score:{our_score:6.1f} Rank:{our_rank:2d}/12 | "
                 f"Avg{window}[Sc:{avg_score:6.1f} Rk:{avg_rank:4.1f}] | "
                 f"ε:{epsilon:.3f}"
             )
 
-        # Save best models
-        if len(all_scores) >= 500:
-            recent_avg = np.mean(all_scores[-500:])
+        # Save best models on 2023
+        if len(all_scores) >= 100:
+            recent_avg = np.mean(all_scores[-100:])
             if recent_avg > best_avg_score:
                 best_avg_score = recent_avg
                 best_models = {
@@ -930,34 +881,37 @@ def train(total_episodes: int = 20000, learning_rate: float = 1e-3):
                     },
                 }
 
-    # Load best models
+    # Load best-on-2023 models before evaluation
     if best_models:
         position_model.load_state_dict(best_models["position"])
         for pos, state in best_models["players"].items():
             player_models[pos].load_state_dict(state)
 
-    print(f"\n✓ Training complete")
+    # Save checkpoint
+    torch.save(
+        {
+            "position": position_model.state_dict(),
+            "players": {
+                pos: model.state_dict() for pos, model in player_models.items()
+            },
+        },
+        "hierarchical_agent_2023_trained.pth",
+    )
 
-    # Summary
-    print("\n" + "=" * 80)
-    print("TRAINING SUMMARY")
-    print("=" * 80)
-    print(f"Episodes: {total_episodes}")
-    print(f"Avg score: {np.mean(all_scores):.1f}")
-    print(f"Best 500-ep avg: {best_avg_score:.1f}")
-    print(f"Avg rank: {np.mean(all_ranks):.2f} / 12")
-    print(f"Final 500 avg score: {np.mean(all_scores[-500:]):.1f}")
-    print(f"Final 500 avg rank: {np.mean(all_ranks[-500:]):.2f}")
+    print("\n[TRAIN] ✓ Finished training on 2023")
+    print(f"[TRAIN] Avg score: {np.mean(all_scores):.1f}")
+    print(f"[TRAIN] Best 100-ep avg: {best_avg_score:.1f}")
+    print(f"[TRAIN] Avg rank: {np.mean(all_ranks):.2f} / 12")
 
-    return position_model, player_models, env, all_scores, all_ranks
+    return position_model, player_models, env_train, all_scores, all_ranks
 
 
 # ============================================================================
 # PLOTTING
 # ============================================================================
 
-def plot_results(scores, ranks):
-    """Quick visualization for single run"""
+def plot_training(scores, ranks, filename: str = "hierarchical_training_2023.png"):
+    """Quick visualization of training performance on 2023"""
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -967,8 +921,8 @@ def plot_results(scores, ranks):
         ma = pd.Series(scores).rolling(100).mean()
         ax.plot(ma, linewidth=2.5, label="100-Ep MA")
     ax.set_xlabel("Episode")
-    ax.set_ylabel("Score")
-    ax.set_title("Training Scores")
+    ax.set_ylabel("Score (2023)")
+    ax.set_title("Training Scores on 2023")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -980,93 +934,108 @@ def plot_results(scores, ranks):
         ax.axhline(y=6.5, linestyle="--", label="Random")
     ax.set_xlabel("Episode")
     ax.set_ylabel("Rank (1=Best)")
-    ax.set_title("Training Ranks")
+    ax.set_title("Training Ranks on 2023")
     ax.set_ylim(12.5, 0.5)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("hierarchical_training.png", dpi=150)
-    print("✓ Saved to hierarchical_training.png")
-    plt.close()
-
-
-def plot_single_run(result, run_id):
-    """Create a chart for a single run showing scores and ranks"""
-    
-    scores = result['scores']
-    ranks = result['ranks']
-    episodes = range(1, len(scores) + 1)
-    
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Plot 1: Scores
-    ax = axes[0]
-    ax.plot(episodes, scores, alpha=0.4, linewidth=0.8, color='blue', label='Score per episode')
-    
-    # Add moving average if enough episodes
-    window = min(100, len(scores) // 4)
-    if window > 1:
-        ma = pd.Series(scores).rolling(window).mean()
-        ax.plot(episodes, ma, linewidth=2.5, color='red', label=f'{window}-Ep MA')
-    
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Score")
-    ax.set_title(f"Run {run_id}: Training Scores (Seed: {result['random_seed']})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # Add stats text box
-    final_avg = result['final_500_avg_score']
-    overall_avg = result['overall_avg_score']
-    best = result['best_score']
-    stats_text = f"Final 500-ep avg: {final_avg:.1f}\nOverall avg: {overall_avg:.1f}\nBest: {best:.1f}"
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
-            fontsize=9, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
-    
-    # Plot 2: Ranks
-    ax = axes[1]
-    ax.plot(episodes, ranks, alpha=0.4, linewidth=0.8, color='green', label='Rank per episode')
-    
-    # Add moving average if enough episodes
-    if window > 1:
-        ma_rank = pd.Series(ranks).rolling(window).mean()
-        ax.plot(episodes, ma_rank, linewidth=2.5, color='red', label=f'{window}-Ep MA')
-    
-    ax.axhline(y=6.5, linestyle='--', color='black', alpha=0.5, label='Random (6.5)')
-    
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Rank (1=Best)")
-    ax.set_title(f"Run {run_id}: Training Ranks")
-    ax.set_ylim(12.5, 0.5)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # Add stats text box
-    final_avg_rank = result['final_500_avg_rank']
-    overall_avg_rank = result['overall_avg_rank']
-    best_rank = result['best_rank']
-    stats_text = f"Final 500-ep avg: {final_avg_rank:.2f}\nOverall avg: {overall_avg_rank:.2f}\nBest: {best_rank}"
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
-            fontsize=9, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
-    
-    plt.tight_layout()
-    plt.savefig(f"run_{run_id:02d}_chart.png", dpi=150)
-    print(f"✓ Saved run_{run_id:02d}_chart.png")
+    plt.savefig(filename, dpi=150)
+    print(f"[PLOT] ✓ Saved training plot to {filename}")
     plt.close()
 
 
 # ============================================================================
-# POLICY INSPECTION / REPORTING
+# EVALUATION ON 2024 (HELD-OUT SEASON)
+# ============================================================================
+
+def evaluate_on_2024(
+    position_model,
+    player_models,
+    condensed_path: str = "nfl_players_condensed.csv",
+    stats_2024_path: str = "nfl_players_2024_stats.csv",
+    n_eval_drafts: int = 500,
+):
+    """
+    Freeze the trained policy and evaluate it on 2024 outcomes only.
+    This is your "non-hindsight" test: the model has never seen 2024
+    rewards during training.
+    """
+
+    device = next(position_model.parameters()).device
+    env_eval = DraftEnvironment(
+        condensed_path=condensed_path,
+        stats_path=stats_2024_path,
+        n_teams=12,
+        n_rounds=8,
+        seed=123,
+    )
+
+    agent_eval = HierarchicalAgent(position_model, player_models, env_eval)
+
+    scores_2024 = []
+    ranks_2024 = []
+
+    print("\n[EVAL] Evaluating frozen 2023-trained policy on 2024...\n")
+
+    for ep in range(n_eval_drafts):
+        our_team = env_eval.reset()
+
+        for rnd in range(1, env_eval.n_rounds + 1):
+            env_eval.current_round = rnd
+            order = env_eval.get_draft_order(rnd)
+
+            for tid in order:
+                if tid == our_team:
+                    # Pure exploitation: epsilon=0, training=False
+                    player, _ = agent_eval.pick_player(
+                        env_eval, tid, rnd, epsilon=0.0, training=False
+                    )
+                    if player is not None:
+                        env_eval.make_pick(tid, player)
+                else:
+                    player = env_eval.bot_pick(tid)
+                    if player is not None:
+                        env_eval.make_pick(tid, player)
+
+        scores_dict = env_eval.evaluate_league()
+        our_score = scores_dict[our_team]
+        league_scores = list(scores_dict.values())
+        our_rank = sorted(league_scores, reverse=True).index(our_score) + 1
+
+        scores_2024.append(our_score)
+        ranks_2024.append(our_rank)
+
+        if (ep + 1) % 50 == 0:
+            print(
+                f"[EVAL] Draft {ep+1:4d}/{n_eval_drafts} | "
+                f"Score_2024:{our_score:6.1f} Rank_2024:{our_rank:2d}/12"
+            )
+
+    # Summary
+    print("\n" + "=" * 80)
+    print("EVALUATION SUMMARY – 2023-TRAINED POLICY ON 2024")
+    print("=" * 80)
+    print(f"Drafts evaluated: {n_eval_drafts}")
+    print(f"Avg 2024 score: {np.mean(scores_2024):.1f}")
+    print(f"Std 2024 score: {np.std(scores_2024):.1f}")
+    print(f"Best 2024 score: {np.max(scores_2024):.1f}")
+    print(f"Worst 2024 score: {np.min(scores_2024):.1f}")
+    print(f"Avg 2024 rank:  {np.mean(ranks_2024):.2f} / 12")
+    print(f"Best 2024 rank: {np.min(ranks_2024)}")
+    print(f"Worst 2024 rank:{np.max(ranks_2024)}")
+    print("=" * 80 + "\n")
+
+    return scores_2024, ranks_2024
+
+
+# ============================================================================
+# SIMPLE POLICY INSPECTION (OPTIONAL)
 # ============================================================================
 
 def inspect_learned_policy(position_model, player_models, env: DraftEnvironment):
-    """
-    Print a human-readable summary of the learned player preferences
-    and a single showcase draft with the trained policy.
-    """
+    """Same as before, but now you can call it either on 2023 or 2024 env."""
+
     device = next(position_model.parameters()).device
     position_model.eval()
     for m in player_models.values():
@@ -1079,23 +1048,9 @@ def inspect_learned_policy(position_model, player_models, env: DraftEnvironment)
     print("HIERARCHICAL RL - Position + Player Policies")
     print("=" * 80)
     print()
-    print("Architecture:")
-    print("  • Position network: decides QB/RB/WR/TE")
-    print("  • Player networks: 4 separate networks for each position")
-    print("  • Learns which specific players to target, not just positions")
-    print("=" * 80)
-    print()
 
-    # ----------------------------------------------------------------------
-    # LEARNED PLAYER PREFERENCES - top 10 per position (neutral-ish context)
-    # ----------------------------------------------------------------------
     mid_team = env.n_teams // 2
     env.reset(our_team_id=mid_team)
-
-    print("=" * 80)
-    print("LEARNED PLAYER PREFERENCES (top players per position)")
-    print("=" * 80)
-    print()
 
     def eval_player_value(row, pos: str):
         if pos == "QB":
@@ -1136,246 +1091,71 @@ def inspect_learned_policy(position_model, player_models, env: DraftEnvironment)
             print(f"  {rank:2d}. {name:<24} value={val:6.3f}  ADP={adp:6.1f}")
         print()
 
-    # ----------------------------------------------------------------------
-    # REALISTIC DRAFT TRACE
-    # ----------------------------------------------------------------------
-    print("=" * 80)
-    print("REALISTIC POSITION POLICY DURING A SHOWCASE DRAFT (MID-SLOT TEAM)")
-    print("=" * 80)
-    print("Showing masked position probabilities for our picks (ε=0),")
-    print(
-        "with bots drafting purely by ADP + slippage under HARD roster constraints."
-    )
-    print()
-
-    showcase_team = env.n_teams // 2
-    env.reset(our_team_id=showcase_team)
-    agent = HierarchicalAgent(position_model, player_models, env)
-
-    with torch.no_grad():
-        for rnd in range(1, env.n_rounds + 1):
-            env.current_round = rnd
-            order = env.get_draft_order(rnd)
-            print(f"Round {rnd}:")
-            for pick_idx, team_id in enumerate(order, start=1):
-                if team_id == showcase_team:
-                    context = env.get_context_vector(team_id, rnd)
-                    ctx = torch.tensor(
-                        context, dtype=torch.float32, device=device
-                    ).unsqueeze(0)
-                    logits = position_model(ctx).squeeze(0)
-
-                    legal_mask = torch.full((4,), float("-inf"), device=device)
-                    for i, pos in enumerate(positions):
-                        if env.get_available_at_position(team_id, pos):
-                            legal_mask[i] = 0.0
-
-                    masked_logits = logits + legal_mask
-                    probs = torch.softmax(masked_logits, dim=0).cpu().numpy()
-                    qb_p, rb_p, wr_p, te_p = probs
-
-                    needs = env.get_roster_needs(team_id)
-                    print(
-                        f"  Pick {pick_idx:2d} (our team): "
-                        f"QB={qb_p:0.2f}, RB={rb_p:0.2f}, WR={wr_p:0.2f}, TE={te_p:0.2f} | "
-                        f"needs: QB={needs['QB']}, RB={needs['RB']}, "
-                        f"WR={needs['WR']}, TE={needs['TE']}, FLEX={needs['FLEX']}"
-                    )
-
-                    player, _ = agent.pick_player(
-                        env, team_id, rnd, epsilon=0.0, training=False
-                    )
-                    if player is not None:
-                        env.make_pick(team_id, player)
-                        name = f"{player['first_name']} {player['last_name']}"
-                        print(
-                            f"    -> Drafted {name} ({player['position']}) "
-                            f"ADP={float(player['fantasy_adp']):.1f} "
-                            f"PPR={float(player['fantasy_points_ppr']):.1f}"
-                        )
-                    else:
-                        print("    -> No legal pick available for our team!")
-                else:
-                    bot_player = env.bot_pick(team_id)
-                    if bot_player is not None:
-                        env.make_pick(team_id, bot_player)
-
-            print()
-
-    print("Final roster for our showcase team:")
-    print_agent_roster(env, showcase_team)
-    print()
-    print("=" * 80)
-    print("✓ HIERARCHICAL RL INSPECTION COMPLETE")
-    print("=" * 80)
-
 
 # ============================================================================
-# MULTI-RUN EXPERIMENT
+# MAIN
 # ============================================================================
 
-def run_single_training(run_id: int, total_episodes: int = 20000, learning_rate: float = 1e-3):
-    """Run a single training session and return results"""
-    
-    # Generate random seed for this run
-    random_seed = np.random.randint(0, 1000000)
-    
-    print("\n" + "=" * 80)
-    print(f"RUN {run_id}/50 - HIERARCHICAL RL")
-    print("=" * 80)
-    print(f"Random seed: {random_seed}")
-    print(f"Episodes: {total_episodes}")
-    print("=" * 80)
+def main():
+    import os
 
-    # Set all random seeds
+    if not os.path.exists("nfl_players_condensed.csv"):
+        print("ERROR: Missing nfl_players_condensed.csv "
+              "(build it with build_condensed_from_2023.py)")
+        return
+
+    if not os.path.exists("nfl_players_2023_stats.csv"):
+        print("ERROR: Missing nfl_players_2023_stats.csv "
+              "(build it with your collect_data/player_condenser pipeline)")
+        return
+
+    if not os.path.exists("nfl_players_2024_stats.csv"):
+        print("ERROR: Missing nfl_players_2024_stats.csv "
+              "(build it with get_2024.py or similar)")
+        return
+
+    # Randomize seed for this run (affects training only)
+    random_seed = np.random.randint(0, 1_000_000)
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
     random.seed(random_seed)
 
-    position_model, player_models, env, scores, ranks = train(
-        total_episodes=total_episodes,
-        learning_rate=learning_rate
+    print("\n" + "=" * 80)
+    print("HIERARCHICAL RL – TRAIN 2023, TEST 2024")
+    print("=" * 80)
+    print(f"Random seed: {random_seed}")
+    print("=" * 80)
+
+    # 1) Train on 2023
+    position_model, player_models, env_2023, scores, ranks = train_on_2023(
+        total_episodes=1500,
+        learning_rate=1e-3,
+        condensed_path="nfl_players_condensed.csv",
+        stats_2023_path="nfl_players_2023_stats.csv",
     )
 
-    # Calculate summary statistics
-    final_500_avg_score = np.mean(scores[-500:])
-    final_500_avg_rank = np.mean(ranks[-500:])
-    overall_avg_score = np.mean(scores)
-    overall_avg_rank = np.mean(ranks)
-    best_score = max(scores)
-    worst_score = min(scores)
-    best_rank = min(ranks)
-    worst_rank = max(ranks)
-    
-    # Find best 100-episode window
-    if len(scores) >= 100:
-        best_window_avg = max(np.convolve(scores, np.ones(100)/100, mode='valid'))
-    else:
-        best_window_avg = np.mean(scores)
+    # 2) Plot training curves
+    plot_training(scores, ranks)
 
-    results = {
-        'run_id': run_id,
-        'random_seed': random_seed,
-        'total_episodes': total_episodes,
-        'final_500_avg_score': final_500_avg_score,
-        'final_500_avg_rank': final_500_avg_rank,
-        'overall_avg_score': overall_avg_score,
-        'overall_avg_rank': overall_avg_rank,
-        'best_100ep_window_avg': best_window_avg,
-        'best_score': best_score,
-        'worst_score': worst_score,
-        'best_rank': best_rank,
-        'worst_rank': worst_rank,
-        'scores': scores,
-        'ranks': ranks
-    }
+    # 3) Evaluate frozen policy on 2024
+    scores_2024, ranks_2024 = evaluate_on_2024(
+        position_model,
+        player_models,
+        condensed_path="nfl_players_condensed.csv",
+        stats_2024_path="nfl_players_2024_stats.csv",
+        n_eval_drafts=500,
+    )
 
-    # Save individual run results
-    run_df = pd.DataFrame({
-        'episode': range(1, len(scores) + 1),
-        'score': scores,
-        'rank': ranks
-    })
-    run_df.to_csv(f"run_{run_id:02d}_episodes.csv", index=False)
-    
-    # Save model for this run
-    torch.save({
-        "position": position_model.state_dict(),
-        "players": {pos: model.state_dict() for pos, model in player_models.items()}
-    }, f"run_{run_id:02d}_model.pth")
-
-    print(f"\n✓ Run {run_id} complete!")
-    print(f"  Final 500-ep avg: Score={final_500_avg_score:.1f}, Rank={final_500_avg_rank:.2f}")
-    print(f"  Saved: run_{run_id:02d}_episodes.csv, run_{run_id:02d}_model.pth")
-
-    return results
-
-
-def main():
-    """Run 50 independent training runs and aggregate results"""
-
-    import os
-    from datetime import datetime
-
-    if not os.path.exists("nfl_players_condensed.csv"):
-        print("ERROR: Missing nfl_players_condensed.csv")
-        return
-
-    n_runs = 50  # Change back to 50 for full experiment
-    total_episodes = 20000  # Change back to 20000 for full experiment
-    
-    print("\n" + "=" * 80)
-    print("MULTI-RUN HIERARCHICAL RL EXPERIMENT")
-    print("=" * 80)
-    print(f"Number of runs: {n_runs}")
-    print(f"Episodes per run: {total_episodes}")
-    print(f"Total episodes across all runs: {n_runs * total_episodes:,}")
-    print("=" * 80)
-
-    all_results = []
-    start_time = datetime.now()
-
-    for run_id in range(1, n_runs + 1):
-        run_start = datetime.now()
-        
-        results = run_single_training(
-            run_id=run_id,
-            total_episodes=total_episodes,
-            learning_rate=1e-3
-        )
-        all_results.append(results)
-        
-        run_duration = (datetime.now() - run_start).total_seconds() / 60
-        elapsed = (datetime.now() - start_time).total_seconds() / 60
-        avg_time_per_run = elapsed / run_id
-        estimated_remaining = avg_time_per_run * (n_runs - run_id)
-        
-        print(f"\n⏱ Run {run_id} took {run_duration:.1f} minutes")
-        print(f"⏱ Total elapsed: {elapsed:.1f} min | Est. remaining: {estimated_remaining:.1f} min")
-        
-        # Create individual chart for this run
-        print(f"\nCreating chart for run {run_id}...")
-        plot_single_run(results, run_id)
-        
-        print("=" * 80)
-
-    # Save summary statistics
-    summary_df = pd.DataFrame([{
-        'run_id': r['run_id'],
-        'random_seed': r['random_seed'],
-        'final_500_avg_score': r['final_500_avg_score'],
-        'final_500_avg_rank': r['final_500_avg_rank'],
-        'overall_avg_score': r['overall_avg_score'],
-        'overall_avg_rank': r['overall_avg_rank'],
-        'best_100ep_window_avg': r['best_100ep_window_avg'],
-        'best_score': r['best_score'],
-        'worst_score': r['worst_score'],
-        'best_rank': r['best_rank'],
-        'worst_rank': r['worst_rank']
-    } for r in all_results])
-    
-    summary_df.to_csv("all_runs_summary.csv", index=False)
-
-    # Print final summary
-    total_time = (datetime.now() - start_time).total_seconds() / 60
-    
-    print("\n" + "=" * 80)
-    print("ALL RUNS COMPLETE - FINAL SUMMARY")
-    print("=" * 80)
-    print(f"\nCompleted {n_runs} runs in {total_time:.1f} minutes ({total_time/60:.1f} hours)")
-    print(f"\nFinal 500-Episode Performance:")
-    print(f"  Avg Score: {summary_df['final_500_avg_score'].mean():.1f} ± {summary_df['final_500_avg_score'].std():.1f}")
-    print(f"  Avg Rank:  {summary_df['final_500_avg_rank'].mean():.2f} ± {summary_df['final_500_avg_rank'].std():.2f}")
-    print(f"  Best Run:  Score={summary_df['final_500_avg_score'].max():.1f}, Rank={summary_df['final_500_avg_rank'].min():.2f}")
-    print(f"  Worst Run: Score={summary_df['final_500_avg_score'].min():.1f}, Rank={summary_df['final_500_avg_rank'].max():.2f}")
-    print(f"\nBest 100-Episode Window:")
-    print(f"  Avg: {summary_df['best_100ep_window_avg'].mean():.1f} ± {summary_df['best_100ep_window_avg'].std():.1f}")
-    print(f"  Best: {summary_df['best_100ep_window_avg'].max():.1f}")
-    print(f"\nFiles saved:")
-    print(f"  • all_runs_summary.csv (summary statistics)")
-    print(f"  • run_XX_episodes.csv (detailed episode data, 50 files)")
-    print(f"  • run_XX_model.pth (trained models, 50 files)")
-    print("=" * 80)
+    # 4) Optional: inspect player preferences on 2024 env
+    env_2024 = DraftEnvironment(
+        condensed_path="nfl_players_condensed.csv",
+        stats_path="nfl_players_2024_stats.csv",
+        n_teams=12,
+        n_rounds=8,
+        seed=999,
+    )
+    print("\n[INSPECT] Learned player preferences on 2024 env:")
+    inspect_learned_policy(position_model, player_models, env_2024)
 
 
 if __name__ == "__main__":
