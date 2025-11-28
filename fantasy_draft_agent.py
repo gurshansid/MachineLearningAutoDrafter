@@ -1,5 +1,6 @@
 """
 FIXED HIERARCHICAL RL - All 5 Networks in One File
+WITH MULTI-RUN CAPABILITY (50 runs x 20,000 episodes)
 
 Fixes:
 1. Feature extraction (was returning all zeros!)
@@ -765,7 +766,7 @@ def should_restart(scores, rank_threshold: float = 8.0):
 # TRAINING
 # ============================================================================
 
-def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
+def train(total_episodes: int = 20000, learning_rate: float = 1e-3):
     """Train hierarchical agent WITHOUT restarts - let it learn!"""
 
     print("=" * 80)
@@ -778,7 +779,7 @@ def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
         "  ✓ HARD roster constraints (exactly 8 players, min 1 QB / 2 RB / 2 WR / 1 TE, QB cap=1)"
     )
     print("  ✓ Agent uses same roster constraints as bots")
-    print("  ✓ Fast epsilon decay")
+    print(f"  ✓ Adaptive epsilon decay for {total_episodes} episodes")
     print("  ✓ NO RESTARTS - let it learn!")
     print("=" * 80)
 
@@ -835,8 +836,11 @@ def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
 
     for episodes_done in range(total_episodes):
 
-        # Current epsilon schedule
-        epsilon = max(0.05, 0.5 - 0.45 * min(1.0, episodes_done / 1000))
+        # Epsilon schedule for 20,000 episodes: 0.9 → 0.05
+        if episodes_done < 12000:
+            epsilon = max(0.10, 0.9 - 0.80 * (episodes_done / 12000))
+        else:
+            epsilon = max(0.05, 0.10 - 0.05 * ((episodes_done - 12000) / 8000))
 
         our_team = env.reset()
         log_probs = []
@@ -901,28 +905,21 @@ def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
         all_scores.append(our_score)
         all_ranks.append(our_rank)
 
-        if (episodes_done + 1) % 50 == 0:
-            window = min(100, len(all_scores))
+        if (episodes_done + 1) % 200 == 0:
+            window = min(500, len(all_scores))
             avg_score = np.mean(all_scores[-window:])
             avg_rank = np.mean(all_ranks[-window:])
 
             print(
-                f"Ep {episodes_done+1:4d}/{total_episodes} | "
+                f"Ep {episodes_done+1:5d}/{total_episodes} | "
                 f"Score:{our_score:6.1f} Rank:{our_rank:2d}/12 | "
                 f"Avg{window}[Sc:{avg_score:6.1f} Rk:{avg_rank:4.1f}] | "
                 f"ε:{epsilon:.3f}"
             )
 
-            print("  Our roster this episode:")
-            print_agent_roster(env, our_team)
-            print()
-
-            # Also print league-wide roster counts to see bot shapes
-            print_league_roster_counts(env)
-
         # Save best models
-        if len(all_scores) >= 100:
-            recent_avg = np.mean(all_scores[-100:])
+        if len(all_scores) >= 500:
+            recent_avg = np.mean(all_scores[-500:])
             if recent_avg > best_avg_score:
                 best_avg_score = recent_avg
                 best_models = {
@@ -939,18 +936,7 @@ def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
         for pos, state in best_models["players"].items():
             player_models[pos].load_state_dict(state)
 
-    # Save
-    torch.save(
-        {
-            "position": position_model.state_dict(),
-            "players": {
-                pos: model.state_dict() for pos, model in player_models.items()
-            },
-        },
-        "hierarchical_agent_final.pth",
-    )
-
-    print("\n✓ Saved to hierarchical_agent_final.pth")
+    print(f"\n✓ Training complete")
 
     # Summary
     print("\n" + "=" * 80)
@@ -958,7 +944,7 @@ def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
     print("=" * 80)
     print(f"Episodes: {total_episodes}")
     print(f"Avg score: {np.mean(all_scores):.1f}")
-    print(f"Best 100-ep avg: {best_avg_score:.1f}")
+    print(f"Best 500-ep avg: {best_avg_score:.1f}")
     print(f"Avg rank: {np.mean(all_ranks):.2f} / 12")
     print(f"Final 500 avg score: {np.mean(all_scores[-500:]):.1f}")
     print(f"Final 500 avg rank: {np.mean(all_ranks[-500:]):.2f}")
@@ -971,7 +957,7 @@ def train(total_episodes: int = 5000, learning_rate: float = 1e-3):
 # ============================================================================
 
 def plot_results(scores, ranks):
-    """Quick visualization"""
+    """Quick visualization for single run"""
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -1002,6 +988,73 @@ def plot_results(scores, ranks):
     plt.tight_layout()
     plt.savefig("hierarchical_training.png", dpi=150)
     print("✓ Saved to hierarchical_training.png")
+    plt.close()
+
+
+def plot_single_run(result, run_id):
+    """Create a chart for a single run showing scores and ranks"""
+    
+    scores = result['scores']
+    ranks = result['ranks']
+    episodes = range(1, len(scores) + 1)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: Scores
+    ax = axes[0]
+    ax.plot(episodes, scores, alpha=0.4, linewidth=0.8, color='blue', label='Score per episode')
+    
+    # Add moving average if enough episodes
+    window = min(100, len(scores) // 4)
+    if window > 1:
+        ma = pd.Series(scores).rolling(window).mean()
+        ax.plot(episodes, ma, linewidth=2.5, color='red', label=f'{window}-Ep MA')
+    
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Score")
+    ax.set_title(f"Run {run_id}: Training Scores (Seed: {result['random_seed']})")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add stats text box
+    final_avg = result['final_500_avg_score']
+    overall_avg = result['overall_avg_score']
+    best = result['best_score']
+    stats_text = f"Final 500-ep avg: {final_avg:.1f}\nOverall avg: {overall_avg:.1f}\nBest: {best:.1f}"
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+    
+    # Plot 2: Ranks
+    ax = axes[1]
+    ax.plot(episodes, ranks, alpha=0.4, linewidth=0.8, color='green', label='Rank per episode')
+    
+    # Add moving average if enough episodes
+    if window > 1:
+        ma_rank = pd.Series(ranks).rolling(window).mean()
+        ax.plot(episodes, ma_rank, linewidth=2.5, color='red', label=f'{window}-Ep MA')
+    
+    ax.axhline(y=6.5, linestyle='--', color='black', alpha=0.5, label='Random (6.5)')
+    
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Rank (1=Best)")
+    ax.set_title(f"Run {run_id}: Training Ranks")
+    ax.set_ylim(12.5, 0.5)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add stats text box
+    final_avg_rank = result['final_500_avg_rank']
+    overall_avg_rank = result['overall_avg_rank']
+    best_rank = result['best_rank']
+    stats_text = f"Final 500-ep avg: {final_avg_rank:.2f}\nOverall avg: {overall_avg_rank:.2f}\nBest: {best_rank}"
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
+    
+    plt.tight_layout()
+    plt.savefig(f"run_{run_id:02d}_chart.png", dpi=150)
+    print(f"✓ Saved run_{run_id:02d}_chart.png")
     plt.close()
 
 
@@ -1158,25 +1211,20 @@ def inspect_learned_policy(position_model, player_models, env: DraftEnvironment)
 
 
 # ============================================================================
-# MAIN
+# MULTI-RUN EXPERIMENT
 # ============================================================================
 
-def main():
-    """Run hierarchical training with random seed"""
-
-    import os
-
-    if not os.path.exists("nfl_players_condensed.csv"):
-        print("ERROR: Missing nfl_players_condensed.csv")
-        return
-
-    # Generate random seed
+def run_single_training(run_id: int, total_episodes: int = 20000, learning_rate: float = 1e-3):
+    """Run a single training session and return results"""
+    
+    # Generate random seed for this run
     random_seed = np.random.randint(0, 1000000)
     
     print("\n" + "=" * 80)
-    print("HIERARCHICAL RL - RANDOM SEED VERSION")
+    print(f"RUN {run_id}/50 - HIERARCHICAL RL")
     print("=" * 80)
     print(f"Random seed: {random_seed}")
+    print(f"Episodes: {total_episodes}")
     print("=" * 80)
 
     # Set all random seeds
@@ -1184,17 +1232,150 @@ def main():
     np.random.seed(random_seed)
     random.seed(random_seed)
 
-    print("\n[STEP 1/3] Training...")
     position_model, player_models, env, scores, ranks = train(
-        total_episodes=1500,
-        learning_rate=1e-3
+        total_episodes=total_episodes,
+        learning_rate=learning_rate
     )
 
-    print("\n[STEP 2/3] Plotting training curves...")
-    plot_results(scores, ranks)
+    # Calculate summary statistics
+    final_500_avg_score = np.mean(scores[-500:])
+    final_500_avg_rank = np.mean(ranks[-500:])
+    overall_avg_score = np.mean(scores)
+    overall_avg_rank = np.mean(ranks)
+    best_score = max(scores)
+    worst_score = min(scores)
+    best_rank = min(ranks)
+    worst_rank = max(ranks)
+    
+    # Find best 100-episode window
+    if len(scores) >= 100:
+        best_window_avg = max(np.convolve(scores, np.ones(100)/100, mode='valid'))
+    else:
+        best_window_avg = np.mean(scores)
 
-    print("\n[STEP 3/3] Inspecting learned policy (positions + players)...\n")
-    inspect_learned_policy(position_model, player_models, env)
+    results = {
+        'run_id': run_id,
+        'random_seed': random_seed,
+        'total_episodes': total_episodes,
+        'final_500_avg_score': final_500_avg_score,
+        'final_500_avg_rank': final_500_avg_rank,
+        'overall_avg_score': overall_avg_score,
+        'overall_avg_rank': overall_avg_rank,
+        'best_100ep_window_avg': best_window_avg,
+        'best_score': best_score,
+        'worst_score': worst_score,
+        'best_rank': best_rank,
+        'worst_rank': worst_rank,
+        'scores': scores,
+        'ranks': ranks
+    }
+
+    # Save individual run results
+    run_df = pd.DataFrame({
+        'episode': range(1, len(scores) + 1),
+        'score': scores,
+        'rank': ranks
+    })
+    run_df.to_csv(f"run_{run_id:02d}_episodes.csv", index=False)
+    
+    # Save model for this run
+    torch.save({
+        "position": position_model.state_dict(),
+        "players": {pos: model.state_dict() for pos, model in player_models.items()}
+    }, f"run_{run_id:02d}_model.pth")
+
+    print(f"\n✓ Run {run_id} complete!")
+    print(f"  Final 500-ep avg: Score={final_500_avg_score:.1f}, Rank={final_500_avg_rank:.2f}")
+    print(f"  Saved: run_{run_id:02d}_episodes.csv, run_{run_id:02d}_model.pth")
+
+    return results
+
+
+def main():
+    """Run 50 independent training runs and aggregate results"""
+
+    import os
+    from datetime import datetime
+
+    if not os.path.exists("nfl_players_condensed.csv"):
+        print("ERROR: Missing nfl_players_condensed.csv")
+        return
+
+    n_runs = 50  # Change back to 50 for full experiment
+    total_episodes = 20000  # Change back to 20000 for full experiment
+    
+    print("\n" + "=" * 80)
+    print("MULTI-RUN HIERARCHICAL RL EXPERIMENT")
+    print("=" * 80)
+    print(f"Number of runs: {n_runs}")
+    print(f"Episodes per run: {total_episodes}")
+    print(f"Total episodes across all runs: {n_runs * total_episodes:,}")
+    print("=" * 80)
+
+    all_results = []
+    start_time = datetime.now()
+
+    for run_id in range(1, n_runs + 1):
+        run_start = datetime.now()
+        
+        results = run_single_training(
+            run_id=run_id,
+            total_episodes=total_episodes,
+            learning_rate=1e-3
+        )
+        all_results.append(results)
+        
+        run_duration = (datetime.now() - run_start).total_seconds() / 60
+        elapsed = (datetime.now() - start_time).total_seconds() / 60
+        avg_time_per_run = elapsed / run_id
+        estimated_remaining = avg_time_per_run * (n_runs - run_id)
+        
+        print(f"\n⏱ Run {run_id} took {run_duration:.1f} minutes")
+        print(f"⏱ Total elapsed: {elapsed:.1f} min | Est. remaining: {estimated_remaining:.1f} min")
+        
+        # Create individual chart for this run
+        print(f"\nCreating chart for run {run_id}...")
+        plot_single_run(results, run_id)
+        
+        print("=" * 80)
+
+    # Save summary statistics
+    summary_df = pd.DataFrame([{
+        'run_id': r['run_id'],
+        'random_seed': r['random_seed'],
+        'final_500_avg_score': r['final_500_avg_score'],
+        'final_500_avg_rank': r['final_500_avg_rank'],
+        'overall_avg_score': r['overall_avg_score'],
+        'overall_avg_rank': r['overall_avg_rank'],
+        'best_100ep_window_avg': r['best_100ep_window_avg'],
+        'best_score': r['best_score'],
+        'worst_score': r['worst_score'],
+        'best_rank': r['best_rank'],
+        'worst_rank': r['worst_rank']
+    } for r in all_results])
+    
+    summary_df.to_csv("all_runs_summary.csv", index=False)
+
+    # Print final summary
+    total_time = (datetime.now() - start_time).total_seconds() / 60
+    
+    print("\n" + "=" * 80)
+    print("ALL RUNS COMPLETE - FINAL SUMMARY")
+    print("=" * 80)
+    print(f"\nCompleted {n_runs} runs in {total_time:.1f} minutes ({total_time/60:.1f} hours)")
+    print(f"\nFinal 500-Episode Performance:")
+    print(f"  Avg Score: {summary_df['final_500_avg_score'].mean():.1f} ± {summary_df['final_500_avg_score'].std():.1f}")
+    print(f"  Avg Rank:  {summary_df['final_500_avg_rank'].mean():.2f} ± {summary_df['final_500_avg_rank'].std():.2f}")
+    print(f"  Best Run:  Score={summary_df['final_500_avg_score'].max():.1f}, Rank={summary_df['final_500_avg_rank'].min():.2f}")
+    print(f"  Worst Run: Score={summary_df['final_500_avg_score'].min():.1f}, Rank={summary_df['final_500_avg_rank'].max():.2f}")
+    print(f"\nBest 100-Episode Window:")
+    print(f"  Avg: {summary_df['best_100ep_window_avg'].mean():.1f} ± {summary_df['best_100ep_window_avg'].std():.1f}")
+    print(f"  Best: {summary_df['best_100ep_window_avg'].max():.1f}")
+    print(f"\nFiles saved:")
+    print(f"  • all_runs_summary.csv (summary statistics)")
+    print(f"  • run_XX_episodes.csv (detailed episode data, 50 files)")
+    print(f"  • run_XX_model.pth (trained models, 50 files)")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
