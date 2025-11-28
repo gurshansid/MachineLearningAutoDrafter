@@ -867,6 +867,8 @@ def train_on_2023(
                 f"Avg{window}[Sc:{avg_score:6.1f} Rk:{avg_rank:4.1f}] | "
                 f"ε:{epsilon:.3f}"
             )
+            # NEW: print position counts for this draft
+            print_league_roster_counts(env_train)
 
         # Save best models on 2023
         if len(all_scores) >= 100:
